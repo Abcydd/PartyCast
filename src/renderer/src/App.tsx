@@ -30,15 +30,17 @@ import { generateRoomCode, formatRoomCode, isRoomCode } from '../../shared/room-
 import type { Message, Participant } from '../../shared/protocol'
 import type { PickedMedia } from '../../shared/electron-api'
 import { defaultSettings, type Settings } from '../../shared/settings'
-import { openPartyRoom, type PartyRoom, type RoomEvents } from '../net/signaling'
+import { openPartyRoom, localPeerId, type PartyRoom, type RoomEvents } from '../net/signaling'
 import { effectiveQuality, estimatedUploadMbps, type Quality } from '../../shared/quality'
 import { REACTIONS, type Reaction } from '../../shared/reactions'
 import { sanitizeChat } from '../../shared/text'
 import { cueAtTime, parseSubtitles, type Cue } from '../../shared/subtitles'
+import { RELAY_BITRATES, type RelayQuality, validRelayUrl } from '../../shared/relay-config'
+import { RelayPublisher, RelayReceiver, RelayError, relayCall } from '../net/relay-media'
 
 type Mode = 'home' | 'host' | 'viewer'
 type ViewerStatus =
-  'connecting' | 'pending' | 'waiting' | 'playing' | 'paused' | 'host-left' | 'room-full' | 'kicked' | 'denied' | 'locked' | 'banned' | 'failed'
+  'connecting' | 'pending' | 'waiting' | 'playing' | 'paused' | 'host-left' | 'room-full' | 'kicked' | 'denied' | 'locked' | 'banned' | 'monthly-cap' | 'failed'
 
 const qualityLabels: Record<Quality, string> = {
   auto: 'Auto · adapts to upload',
@@ -59,6 +61,7 @@ const viewerMessages: Record<ViewerStatus, string> = {
   denied: 'Host denied your request',
   locked: 'Room locked',
   banned: 'Banned from this room',
+  'monthly-cap': 'Relay monthly usage cap reached',
   failed: 'Could not connect (try TURN in settings)',
 }
 const terminalStatuses: ViewerStatus[] = ['host-left', 'room-full', 'kicked', 'denied', 'locked', 'banned', 'failed']
@@ -99,6 +102,12 @@ export function App(): React.JSX.Element {
   const [subtitleSize, setSubtitleSize] = useState<'S' | 'M' | 'L'>('M')
   const [kickTarget, setKickTarget] = useState<string | null>(null)
   const [hostName, setHostName] = useState('Host')
+  const [hasRelayKey, setHasRelayKey] = useState(false)
+  const [transportChoice, setTransportChoice] = useState<'relay' | 'direct'>('direct')
+  const [relayQuality, setRelayQuality] = useState<RelayQuality>('1080p')
+  const [streamStats, setStreamStats] = useState('')
+  const [toast, setToast] = useState('')
+  const [viewerRelay, setViewerRelay] = useState(false)
   const roomRef = useRef<PartyRoom | null>(null)
   const sessionRef = useRef<HostSession>(createHostSession(8))
   const mediaRef = useRef<PickedMedia | null>(null)
@@ -109,6 +118,10 @@ export function App(): React.JSX.Element {
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
   const lastCueRef = useRef<string | null>(null)
+  const relayRoomRef = useRef<{ roomId: string; code: string } | null>(null)
+  const publisherRef = useRef<RelayPublisher | null>(null)
+  const receiverRef = useRef<RelayReceiver | null>(null)
+  const lastRelayRevisionRef = useRef(0)
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ block: 'end' }) }, [chat])
   const addChat = (line: Omit<ChatLine, 'key'>): void => setChat(old => [...old.slice(-199), { ...line, key: Date.now() + Math.random() }])
@@ -123,6 +136,7 @@ export function App(): React.JSX.Element {
       .loadSettings()
       .then(setSettings)
       .catch(() => setSettings(defaultSettings))
+    void window.partycast.relayHasKey().then(value => { setHasRelayKey(value); if (value) setTransportChoice('relay') }).catch(() => {})
   }, [])
   useEffect(() => {
     if (viewerVideoRef.current) viewerVideoRef.current.volume = viewerVolume
@@ -133,6 +147,10 @@ export function App(): React.JSX.Element {
       roomRef.current = null
       void (async () => {
         if (room && mode === 'host') await room.send({ version: 1, type: 'room-closed' }).catch(() => {})
+        await receiverRef.current?.close().catch(() => {})
+        await publisherRef.current?.close().catch(() => {})
+        if (relayRoomRef.current && mode === 'host') await relayCall('roomClose', { roomId: relayRoomRef.current.roomId }).catch(() => {})
+        if (mode === 'host') await window.partycast.runHostHook('stop').catch(() => {})
         await room?.leave().catch(() => {})
         window.partycast.closeReady()
       })()
@@ -157,6 +175,7 @@ export function App(): React.JSX.Element {
       currentTime: safeTime(video?.currentTime ?? 0),
       duration: safeTime(video?.duration ?? 0),
       title: mediaRef.current?.title ?? null,
+      ...(relayRoomRef.current ? { relayRevision: publisherRef.current?.generation ?? 0 } : {}),
     }
   }, [])
   const sendState = useCallback(
@@ -184,6 +203,17 @@ export function App(): React.JSX.Element {
     const room = roomRef.current
     roomRef.current = null
     if (notify && room) await room.send({ version: 1, type: 'room-closed' }).catch(() => {})
+    await receiverRef.current?.close().catch(() => {})
+    receiverRef.current = null
+    lastRelayRevisionRef.current = 0
+    await publisherRef.current?.close().catch(() => {})
+    publisherRef.current = null
+    if (relayRoomRef.current) await relayCall('roomClose', { roomId: relayRoomRef.current.roomId }).catch(() => {})
+    relayRoomRef.current = null
+    if (notify) {
+      const hook = await window.partycast.runHostHook('stop').catch(() => ({ ok: false, ran: false, message: 'Stop hook failed' }))
+      if (!hook.ok) setToast(hook.message ?? 'Stop hook failed')
+    }
     await room?.leave().catch(() => {})
     captureRef.current?.getTracks().forEach((track) => track.stop())
     captureRef.current = null
@@ -198,17 +228,39 @@ export function App(): React.JSX.Element {
     setFloating([])
     setSubtitleCues([])
     setSubtitleText(null)
+    setStreamStats('')
     sessionRef.current = closeHostSession(sessionRef.current)
     setMode('home')
   }, [])
 
-  const startHost = (): void => {
+  const startHost = async (): Promise<void> => {
     if (!settings?.displayName.trim()) {
       setError('Enter your display name first.')
       return
     }
-    if (settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
-    const code = generateRoomCode()
+    const relayHost = transportChoice === 'relay' && hasRelayKey
+    if (!relayHost && settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
+    let code = generateRoomCode()
+    let iceServers: RTCIceServer[] | undefined
+    let qaControlDirect = false
+    if (relayHost) {
+      try {
+        setError('Starting Cloudflare relay…')
+        const created = await relayCall('roomCreate', { hostPeerId: localPeerId(), bitrateMbps: RELAY_BITRATES[relayQuality] / 1_000_000 })
+        if (typeof created.roomId !== 'string' || typeof created.code !== 'string' || !isRoomCode(created.code)) throw new Error('Invalid room response')
+        relayRoomRef.current = { roomId: created.roomId, code: created.code }
+        code = created.code
+        const turn = await relayCall('turn', {})
+        if (!Array.isArray(turn.iceServers) || !turn.iceServers.length) throw new Error('TURN credentials unavailable')
+        iceServers = turn.iceServers as RTCIceServer[]
+        qaControlDirect = turn.qaControlDirect === true
+      } catch (cause) {
+        if (relayRoomRef.current) await relayCall('roomClose', { roomId: relayRoomRef.current.roomId }).catch(() => {})
+        relayRoomRef.current = null
+        setError(cause instanceof Error ? `Could not start relay: ${cause.message}` : 'Could not start relay')
+        return
+      }
+    }
     const name = settings.displayName.trim()
     setHostName(name)
     setError('')
@@ -218,7 +270,7 @@ export function App(): React.JSX.Element {
     setMedia(null)
     setChat([])
     mediaRef.current = null
-    setMode('host')
+    if (relayRoomRef.current && iceServers) publisherRef.current = new RelayPublisher(relayRoomRef.current.roomId, iceServers, relayQuality)
     const events: RoomEvents = {
       canJoin: peerId => admission(sessionRef.current, peerId),
       onPeerConnecting: (peerId) => setConnectingPeers((old) => (old.includes(peerId) ? old : [...old.slice(-31), peerId])),
@@ -255,14 +307,18 @@ export function App(): React.JSX.Element {
       onAbuse: peerId => { void kick(peerId, true) },
     }
     try {
-      roomRef.current = openPartyRoom('host', code, settings, events, quality)
+      roomRef.current = openPartyRoom('host', code, settings, events, quality, relayHost ? { iceServers, relayControl: !qaControlDirect } : {})
+      setMode('host')
+      void window.partycast.runHostHook('start').then(result => { if (!result.ok) setToast(result.message ?? 'Start hook failed') }).catch(() => setToast('Start hook failed'))
     } catch {
+      if (relayRoomRef.current) void relayCall('roomClose', { roomId: relayRoomRef.current.roomId }).catch(() => {})
+      relayRoomRef.current = null; publisherRef.current = null
       setError('Could not open the room. Check your connection.')
       setMode('home')
     }
   }
 
-  const startViewer = (): void => {
+  const startViewer = async (): Promise<void> => {
     if (!settings?.displayName.trim()) {
       setError('Enter your display name first.')
       return
@@ -271,8 +327,18 @@ export function App(): React.JSX.Element {
       setError('Enter a valid 6-character room code.')
       return
     }
-    if (settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
     const code = formatRoomCode(codeInput)
+    let pinnedHostId: string | undefined
+    try {
+      const lookup = await relayCall('lookup', { code })
+      if (lookup.mode !== 'relay' || typeof lookup.hostPeerId !== 'string' || typeof lookup.roomId !== 'string') throw new Error('Invalid relay room')
+      pinnedHostId = lookup.hostPeerId
+    } catch (cause) {
+      if (!(cause instanceof RelayError && cause.status === 404)) { setError('Could not check the relay room. Try again when the relay is reachable.'); return }
+      if (settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
+    }
+    setViewerRelay(!!pinnedHostId)
+    lastRelayRevisionRef.current = 0
     const name = settings.displayName.trim()
     setRoomCode(code)
     setError('')
@@ -292,14 +358,26 @@ export function App(): React.JSX.Element {
           .catch(() => {})
       },
       onPeerLeave: () => {
+        void receiverRef.current?.close().catch(() => {})
         if (connected) setViewerStatus((status) => (terminalStatuses.includes(status) ? status : 'host-left'))
       },
       onMessage: (message) => {
         if (message.type === 'approval') {
           setViewerStatus(message.accepted ? 'waiting' : 'denied')
+          if (message.relay) receiverRef.current = new RelayReceiver(message.relay.ticket, stream => {
+            const video = viewerVideoRef.current
+            if (video) { video.srcObject = stream; void video.play().catch(() => setError('Press play to start the stream.')) }
+          }, () => setViewerStatus('monthly-cap'))
         } else if (message.type === 'hello' && message.role === 'host') setHostName(message.name)
         else if (message.type === 'state') {
           setViewerState(message)
+          if (message.title && receiverRef.current && message.relayRevision) {
+            const nextRevision = message.relayRevision
+            const previousRevision = lastRelayRevisionRef.current
+            lastRelayRevisionRef.current = nextRevision
+            const task = previousRevision > 0 && previousRevision !== nextRevision ? receiverRef.current.restart() : receiverRef.current.pull()
+            void task.catch(cause => { if (!(cause instanceof RelayError && cause.status === 409)) setError('Could not receive relay stream.') })
+          }
           setViewerStatus((status) =>
             terminalStatuses.includes(status) || status === 'pending'
               ? status
@@ -319,6 +397,7 @@ export function App(): React.JSX.Element {
         else if (message.type === 'subtitle') setSubtitleText(message.text)
       },
       onStream: (stream) => {
+        if (pinnedHostId) return
         const video = viewerVideoRef.current
         if (video && video.srcObject !== stream) {
           video.srcObject = stream
@@ -330,7 +409,7 @@ export function App(): React.JSX.Element {
       },
     }
     try {
-      roomRef.current = openPartyRoom('viewer', code, settings, events)
+      roomRef.current = openPartyRoom('viewer', code, settings, events, 'auto', pinnedHostId ? { pinnedHostId, iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } : {})
       timeoutRef.current = setTimeout(() => {
         if (!connected) setViewerStatus('failed')
       }, 25000)
@@ -401,13 +480,16 @@ export function App(): React.JSX.Element {
       }
       captureRef.current = stream
       stream.addEventListener('addtrack', () => {
-        void roomRef.current?.setHostStream(stream).catch(() => {})
+        if (publisherRef.current) void publisherRef.current.setStream(stream).catch(() => setError('Could not publish to Cloudflare relay.'))
+        else void roomRef.current?.setHostStream(stream).catch(() => {})
       })
       stream.addEventListener('removetrack', () => {
-        void roomRef.current?.setHostStream(stream).catch(() => {})
+        if (publisherRef.current) void publisherRef.current.setStream(stream).catch(() => setError('Could not update relay stream.'))
+        else void roomRef.current?.setHostStream(stream).catch(() => {})
       })
     }
-    void roomRef.current?.setHostStream(captureRef.current).catch(() => {})
+    if (publisherRef.current) void publisherRef.current.setStream(captureRef.current).catch(() => setError('Could not publish to Cloudflare relay.'))
+    else void roomRef.current?.setHostStream(captureRef.current).catch(() => {})
     sendState()
   }
 
@@ -419,9 +501,25 @@ export function App(): React.JSX.Element {
   const acceptViewer = async (peerId: string): Promise<void> => {
     const pending = sessionRef.current.pending.find(p => p.peerId === peerId)
     if (!pending) return
+    let relay: { roomId: string; ticket: string } | undefined
+    if (relayRoomRef.current) {
+      try {
+        const issued = await relayCall('ticket', { roomId: relayRoomRef.current.roomId, viewerId: peerId })
+        if (typeof issued.ticket !== 'string') throw new Error('Invalid ticket')
+        relay = { roomId: relayRoomRef.current.roomId, ticket: issued.ticket }
+      } catch (cause) {
+        const cap = cause instanceof RelayError && cause.reason === 'monthly-cap'
+        await roomRef.current?.send({ version: 1, type: 'kick', reason: cap ? 'monthly-cap' : 'denied' }, peerId).catch(() => {})
+        roomRef.current?.rejectPeer(peerId)
+        sessionRef.current = removeViewer(sessionRef.current, peerId)
+        setSession(sessionRef.current)
+        setToast(cap ? 'Relay monthly usage cap reached. New viewers cannot join.' : 'Could not issue a viewer ticket.')
+        return
+      }
+    }
     sessionRef.current = approveViewer(sessionRef.current, peerId)
     setSession(sessionRef.current)
-    await roomRef.current?.send({ version: 1, type: 'approval', accepted: true }, peerId).catch(() => {})
+    await roomRef.current?.send({ version: 1, type: 'approval', accepted: true, ...(relay ? { relay } : {}) }, peerId).catch(() => {})
     await roomRef.current?.approvePeer(peerId).catch(() => {})
     void roomRef.current?.send({ version: 1, type: 'hello', name: settings?.displayName ?? 'Host', role: 'host' }, peerId).catch(() => {})
     sendRoster(settings?.displayName ?? 'Host')
@@ -432,6 +530,7 @@ export function App(): React.JSX.Element {
   const kick = async (peerId: string, ban = false): Promise<void> => {
     const person = sessionRef.current.viewers.find(p => p.peerId === peerId) ?? sessionRef.current.pending.find(p => p.peerId === peerId)
     const pending = sessionRef.current.pending.some(p => p.peerId === peerId)
+    if (relayRoomRef.current && !pending) await relayCall('revoke', { roomId: relayRoomRef.current.roomId, viewerId: peerId }).catch(() => setToast('Could not revoke relay access. Close the room to stop this viewer.'))
     await roomRef.current?.send({ version: 1, type: 'kick', reason: pending ? 'denied' : 'kicked' }, peerId).catch(() => {})
     roomRef.current?.rejectPeer(peerId)
     sessionRef.current = removeViewer(sessionRef.current, peerId, ban)
@@ -467,7 +566,29 @@ export function App(): React.JSX.Element {
     setQuality(next)
   }
   const actualQuality = effectiveQuality(quality, session.viewers.length, settings?.uploadMbps ?? 6)
-  useEffect(() => { if (mode === 'host') void roomRef.current?.setQuality(actualQuality) }, [mode, actualQuality])
+  useEffect(() => { if (mode === 'host' && !relayRoomRef.current) void roomRef.current?.setQuality(actualQuality) }, [mode, actualQuality])
+  useEffect(() => {
+    if (mode !== 'host' || !relayRoomRef.current) return
+    void publisherRef.current?.setQuality(relayQuality).catch(() => {})
+    void relayCall('roomHeartbeat', { roomId: relayRoomRef.current.roomId, bitrateMbps: RELAY_BITRATES[relayQuality] / 1_000_000 }).catch(() => setToast('Relay heartbeat failed.'))
+  }, [mode, relayQuality])
+  useEffect(() => {
+    if (mode !== 'host') return
+    const timer = setInterval(() => {
+      void (relayRoomRef.current ? publisherRef.current?.stats() : roomRef.current?.stats())?.then(setStreamStats).catch(() => {})
+    }, 2000)
+    return () => clearInterval(timer)
+  }, [mode])
+  useEffect(() => {
+    if (mode !== 'host' || !relayRoomRef.current) return
+    const timer = setInterval(() => { if (relayRoomRef.current) void relayCall('roomHeartbeat', { roomId: relayRoomRef.current.roomId, bitrateMbps: RELAY_BITRATES[relayQuality] / 1_000_000 }).catch(() => setToast('Relay heartbeat failed.')) }, 60000)
+    return () => clearInterval(timer)
+  }, [mode, relayQuality])
+  useEffect(() => {
+    if (mode !== 'viewer') return
+    const timer = setInterval(() => { void receiverRef.current?.heartbeat().catch(() => setError('Relay heartbeat failed.')) }, 60000)
+    return () => clearInterval(timer)
+  }, [mode])
 
   const openSettings = (): void => {
     setDraftSettings(structuredClone(settings ?? defaultSettings))
@@ -475,6 +596,7 @@ export function App(): React.JSX.Element {
   }
   const saveSettings = async (): Promise<void> => {
     try {
+      if (!validRelayUrl(draftSettings.relayUrl)) { setError('Relay URL must be an HTTPS origin.'); return }
       const saved = await window.partycast.saveSettings(draftSettings)
       setSettings(saved)
       setSettingsOpen(false)
@@ -520,6 +642,7 @@ export function App(): React.JSX.Element {
           </button>
         </div>
       </header>
+      {toast && <div className="toast" role="status">{toast}<button aria-label="Dismiss" onClick={() => setToast('')}>×</button></div>}
 
       {mode === 'home' && (
         <main className="home-wrap">
@@ -583,6 +706,7 @@ export function App(): React.JSX.Element {
               <span className="card-arrow">↗</span>
             </button>
           </div>
+          {hasRelayKey && <div className="transport-choice"><label htmlFor="transport-mode">HOST CONNECTION</label><select id="transport-mode" value={transportChoice} onChange={event => setTransportChoice(event.target.value as 'relay' | 'direct')}><option value="relay">Cloudflare relay (recommended · hides your IP · any number of friends)</option><option value="direct">Direct (your IP may be visible)</option></select></div>}
           {joining && (
             <form
               className="join-form"
@@ -613,7 +737,7 @@ export function App(): React.JSX.Element {
               {error}
             </p>
           )}
-          <div className="home-footnote">No account. No uploads. The host streams directly to friends.</div>
+          <div className="home-footnote">No account. Host directly or send one stream through Cloudflare relay.</div>
         </main>
       )}
 
@@ -743,24 +867,13 @@ export function App(): React.JSX.Element {
               </div>
               <div className="code-note">{copied ? 'Copied to clipboard' : 'Code is case insensitive'}</div>
               <label className="toggle-line"><input type="checkbox" checked={session.locked} onChange={event => { sessionRef.current = setLocked(sessionRef.current, event.target.checked); setSession(sessionRef.current) }} /> Lock room</label>
-              {!settings?.relayOnly && <p className="privacy-note">Your IP is visible to viewers you accept.</p>}
+              {!relayRoomRef.current && !settings?.relayOnly && <p className="privacy-note">Your IP is visible to viewers you accept.</p>}
+              {relayRoomRef.current && <p className="privacy-note">Cloudflare relay · viewers do not see your IP.</p>}
             </section>
             <section className="sidebar-block">
               <div className="sidebar-label">STREAM QUALITY</div>
-              <select
-                aria-label="Stream quality"
-                value={quality}
-                onChange={(event) => applyQuality(event.target.value as Quality)}
-              >
-                {Object.entries(qualityLabels).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-              <p className="bandwidth-note">
-                Using ~{estimatedUploadMbps(actualQuality, session.viewers.length).toFixed(1)} Mbps of your {settings?.uploadMbps ?? 6} Mbps upload ({actualQuality}).
-              </p>
+              {relayRoomRef.current ? <><select aria-label="Relay quality" value={relayQuality} onChange={event => setRelayQuality(event.target.value as RelayQuality)}><option value="1080p">1080p · 4.5 Mbps</option><option value="1080p-high">1080p High · 6 Mbps</option><option value="720p">720p · 2.5 Mbps</option></select><p className="bandwidth-note">One upload: {(RELAY_BITRATES[relayQuality] / 1_000_000).toFixed(1)} Mbps, regardless of viewer count.</p></> : <><select aria-label="Stream quality" value={quality} onChange={event => applyQuality(event.target.value as Quality)}>{Object.entries(qualityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><p className="bandwidth-note">Using ~{estimatedUploadMbps(actualQuality, session.viewers.length).toFixed(1)} Mbps of your {settings?.uploadMbps ?? 6} Mbps upload ({actualQuality}).</p></>}
+              <p className="stream-stats">{streamStats}</p>
             </section>
             <section className="sidebar-block participants-block">
               <div className="participant-heading">
@@ -831,7 +944,7 @@ export function App(): React.JSX.Element {
           <div className="viewer-header">
             <div>
               <div className="section-kicker">
-                <span className="live-dot" /> WATCHING ROOM {roomCode}
+                <span className="live-dot" /> WATCHING ROOM {roomCode} {viewerRelay ? '· CLOUDFLARE RELAY' : '· DIRECT'}
               </div>
               <h2>{viewerState?.title ?? 'The party is getting ready'}</h2>
             </div>
@@ -864,7 +977,7 @@ export function App(): React.JSX.Element {
                 </div>
                 <h3>{viewerMessages[viewerStatus]}</h3>
                 {viewerStatus === 'connecting' && (
-                  <p>Finding the host and establishing a direct connection.</p>
+                  <p>Finding the host and establishing the control connection.</p>
                 )}
                 {viewerStatus === 'waiting' && (
                   <p>The stream will appear here as soon as the host starts a video.</p>
@@ -956,6 +1069,24 @@ export function App(): React.JSX.Element {
               </button>
             </div>
             <div className="settings-body">
+              <div className="sidebar-label">CLOUDFLARE RELAY</div>
+              <p>The host key stays encrypted on this computer. Viewers need no key.</p>
+              <label htmlFor="relay-url">Relay URL (HTTPS)</label>
+              <input id="relay-url" value={draftSettings.relayUrl} onChange={event => setDraftSettings(old => ({ ...old, relayUrl: event.target.value }))} />
+              <button className="button-subtle" onClick={() => { void window.partycast.relayImport().then(async imported => { if (!imported) return; const loaded = await window.partycast.loadSettings(); setSettings(loaded); setDraftSettings(loaded); setHasRelayKey(true); setTransportChoice('relay'); setToast('Relay key imported securely.') }).catch(() => setToast('Could not import relay key file.')) }}>Import…</button>
+              <span className="settings-hint">{hasRelayKey ? 'Host key stored securely' : 'No host key imported'}</span>
+              <div className="settings-divider" />
+              <div className="sidebar-label">HOST HOOKS</div>
+              <p>Local commands run without a shell when hosting starts or stops. Use full executable paths.</p>
+              <label htmlFor="hook-start-path">When hosting starts run · executable</label>
+              <input id="hook-start-path" value={draftSettings.hostStartHook.executable} onChange={event => setDraftSettings(old => ({ ...old, hostStartHook: { ...old.hostStartHook, executable: event.target.value } }))} placeholder="C:\Program Files\Docker\docker.exe" />
+              <label htmlFor="hook-start-args">Arguments · one per line</label>
+              <textarea id="hook-start-args" value={draftSettings.hostStartHook.args.join('\n')} onChange={event => setDraftSettings(old => ({ ...old, hostStartHook: { ...old.hostStartHook, args: event.target.value ? event.target.value.split('\n') : [] } }))} />
+              <label htmlFor="hook-stop-path">When hosting stops run · executable</label>
+              <input id="hook-stop-path" value={draftSettings.hostStopHook.executable} onChange={event => setDraftSettings(old => ({ ...old, hostStopHook: { ...old.hostStopHook, executable: event.target.value } }))} placeholder="C:\Program Files\Docker\docker.exe" />
+              <label htmlFor="hook-stop-args">Arguments · one per line</label>
+              <textarea id="hook-stop-args" value={draftSettings.hostStopHook.args.join('\n')} onChange={event => setDraftSettings(old => ({ ...old, hostStopHook: { ...old.hostStopHook, args: event.target.value ? event.target.value.split('\n') : [] } }))} />
+              <div className="settings-divider" />
               <label htmlFor="max-viewers">
                 Maximum viewers <small>Applies to the next room you host · 1–32</small>
               </label>

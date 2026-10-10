@@ -2,4 +2,6 @@ node_modules/
 out/
 dist/
 release/
+relay/.dev.vars
+relay/.wrangler/
 .impeccable/

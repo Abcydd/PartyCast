@@ -7,6 +7,9 @@ import { pathToFileURL } from 'node:url'
 import { basename, extname, join, resolve, dirname, parse } from 'node:path'
 import { loadSettings, saveSettings } from './settings'
 import { readSubtitle } from './subtitle-file'
+import { relayEndpoint } from './relay-ipc'
+import { getHostKey, importRelayConfig } from './relay-security'
+import { executeHook } from './hooks'
 import { parseRangeHeader } from './range'
 import type { PickedMedia } from '../shared/electron-api'
 
@@ -156,6 +159,56 @@ app.whenReady().then(() => {
     if (!trusted(event) || typeof input !== 'string' || input.length > 32768) return null
     return readSubtitle(resolve(input))
   })
+  ipcMain.handle('relay:has-key', async event => trusted(event) ? !!(await getHostKey()) || process.env.PARTYCAST_QA === '1' && !!process.env.PARTYCAST_QA_HOST_KEY : false)
+  ipcMain.handle('relay:import', event => trusted(event) ? importRelayConfig() : null)
+  ipcMain.handle('relay:call', async (event, input: unknown) => {
+    if (!trusted(event)) return { status: 403, body: { error: 'forbidden' } }
+    const endpoint = relayEndpoint(input)
+    if (!endpoint || endpoint.body && JSON.stringify(endpoint.body).length > 65536) return { status: 400, body: { error: 'invalid-request' } }
+    const settings = await loadSettings(settingsPath())
+    const key = endpoint.host ? process.env.PARTYCAST_QA === '1' && process.env.PARTYCAST_QA_HOST_KEY || await getHostKey() : endpoint.ticket
+    if (endpoint.host && !key) return { status: 401, body: { error: 'missing-host-key' } }
+    const base = process.env.PARTYCAST_QA === '1' && process.env.PARTYCAST_QA_RELAY_URL || settings.relayUrl
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 10000)
+    try {
+      const response = await fetch(`${base}${endpoint.path}`, { method: endpoint.method, headers: { ...(key ? { authorization: `Bearer ${key}` } : {}), 'content-type': 'application/json' }, body: endpoint.body === undefined ? undefined : JSON.stringify(endpoint.body), signal: controller.signal })
+      const raw = await response.text()
+      if (raw.length > 65536) return { status: 502, body: { error: 'relay-response-too-large' } }
+      const body = JSON.parse(raw) as unknown
+      if (process.env.PARTYCAST_QA === '1' && process.env.PARTYCAST_QA_CONTROL_DIRECT === '1' && endpoint.path === '/v1/turn' && response.ok)
+        return { status: response.status, body: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], qaControlDirect: true } }
+      return { status: response.status, body }
+    } catch { return { status: 503, body: { error: 'relay-unavailable' } } }
+    finally { clearTimeout(timer) }
+  })
+  let hookStarted = false
+  let stoppingHook = false
+  let startTask: Promise<{ ok: boolean; message?: string; ran: boolean }> | null = null
+  const stopHook = async (): Promise<{ ok: boolean; message?: string; ran: boolean }> => {
+    if (startTask) await startTask
+    if (!hookStarted || stoppingHook) return { ok: true, ran: false }
+    hookStarted = false; stoppingHook = true
+    const result = await executeHook((await loadSettings(settingsPath())).hostStopHook)
+    stoppingHook = false
+    return result
+  }
+  ipcMain.handle('hook:start', async event => {
+    if (!trusted(event) || hookStarted || startTask) return { ok: false, ran: false, message: 'Hook is already active' }
+    startTask = (async () => executeHook((await loadSettings(settingsPath())).hostStartHook))()
+    try {
+      const result = await startTask
+      hookStarted = result.ran
+      return result
+    } finally { startTask = null }
+  })
+  ipcMain.handle('hook:stop', event => trusted(event) ? stopHook() : { ok: false, ran: false })
+  app.on('before-quit', event => {
+    if (!hookStarted && !startTask) return
+    event.preventDefault()
+    void stopHook().finally(() => app.quit())
+  })
+  app.on('render-process-gone', () => { void stopHook() })
 
   createWindow()
   app.on('activate', () => {

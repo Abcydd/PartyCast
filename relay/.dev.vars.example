@@ -1,0 +1,6 @@
+TURN_KEY_ID=replace-with-turn-key-id
+TURN_API_TOKEN=replace-with-turn-api-token
+SFU_APP_ID=replace-with-sfu-app-id
+SFU_APP_SECRET=replace-with-sfu-app-secret
+HOST_KEY=replace-with-a-long-random-host-key
+MOCK_SFU=1

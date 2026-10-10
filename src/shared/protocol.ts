@@ -6,10 +6,10 @@ export const MAX_MESSAGE_BYTES = 4096
 export type Participant = { peerId: string; name: string; connection: 'connecting' | 'connected' | 'failed' }
 export type Message =
   | { version: 1; type: 'hello'; name: string; role: 'host' | 'viewer' }
-  | { version: 1; type: 'approval'; accepted: boolean }
+  | { version: 1; type: 'approval'; accepted: boolean; relay?: { roomId: string; ticket: string } }
   | { version: 1; type: 'roster'; participants: Participant[] }
-  | { version: 1; type: 'state'; playing: boolean; currentTime: number; duration: number; title: string | null }
-  | { version: 1; type: 'kick'; reason: 'kicked' | 'room-full' | 'denied' | 'locked' | 'banned' }
+  | { version: 1; type: 'state'; playing: boolean; currentTime: number; duration: number; title: string | null; relayRevision?: number }
+  | { version: 1; type: 'kick'; reason: 'kicked' | 'room-full' | 'denied' | 'locked' | 'banned' | 'monthly-cap' }
   | { version: 1; type: 'room-closed' }
   | { version: 1; type: 'chat'; text: string }
   | { version: 1; type: 'chat-delivery'; senderId: string; text: string; time: number }
@@ -33,10 +33,10 @@ export function decodeMessage(raw: unknown): Message | null {
   if (!record(v) || v.version !== PROTOCOL_VERSION) return null
   switch (v.type) {
     case 'hello': return bounded(v.name, 32) && sanitizeName(v.name) && (v.role === 'host' || v.role === 'viewer') ? { version: 1, type: 'hello', name: sanitizeName(v.name), role: v.role } : null
-    case 'approval': return typeof v.accepted === 'boolean' ? { version: 1, type: 'approval', accepted: v.accepted } : null
+    case 'approval': return typeof v.accepted === 'boolean' && (v.relay === undefined || v.accepted && record(v.relay) && Object.keys(v.relay).length === 2 && typeof v.relay.roomId === 'string' && /^[a-f0-9-]{36}$/.test(v.relay.roomId) && typeof v.relay.ticket === 'string' && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v.relay.ticket) && v.relay.ticket.length <= 1024) ? { version: 1, type: 'approval', accepted: v.accepted, ...(v.relay ? { relay: v.relay as { roomId: string; ticket: string } } : {}) } : null
     case 'roster': return Array.isArray(v.participants) && v.participants.length <= 32 && v.participants.every((p: unknown) => record(p) && peerId(p.peerId) && bounded(p.name, 32) && ['connecting','connected','failed'].includes(String(p.connection))) ? { version: 1, type: 'roster', participants: v.participants.map((p: Participant) => ({ ...p, name: sanitizeName(p.name) })) } : null
-    case 'state': return typeof v.playing === 'boolean' && time(v.currentTime) && time(v.duration) && (v.title === null || typeof v.title === 'string' && v.title.length <= 256) ? { version: 1, type: 'state', playing: v.playing, currentTime: v.currentTime, duration: v.duration, title: v.title === null ? null : sanitizeText(v.title as string, 256) } : null
-    case 'kick': return ['kicked','room-full','denied','locked','banned'].includes(String(v.reason)) ? { version: 1, type: 'kick', reason: v.reason as Extract<Message,{type:'kick'}>['reason'] } : null
+    case 'state': return typeof v.playing === 'boolean' && time(v.currentTime) && time(v.duration) && (v.title === null || typeof v.title === 'string' && v.title.length <= 256) && (v.relayRevision === undefined || Number.isSafeInteger(v.relayRevision) && (v.relayRevision as number) >= 0) ? { version: 1, type: 'state', playing: v.playing, currentTime: v.currentTime, duration: v.duration, title: v.title === null ? null : sanitizeText(v.title as string, 256), ...(v.relayRevision === undefined ? {} : { relayRevision: v.relayRevision as number }) } : null
+    case 'kick': return ['kicked','room-full','denied','locked','banned','monthly-cap'].includes(String(v.reason)) ? { version: 1, type: 'kick', reason: v.reason as Extract<Message,{type:'kick'}>['reason'] } : null
     case 'room-closed': return { version: 1, type: 'room-closed' }
     case 'chat': return bounded(v.text, 500) && sanitizeChat(v.text) ? { version: 1, type: 'chat', text: sanitizeChat(v.text) } : null
     case 'chat-delivery': return peerId(v.senderId) && bounded(v.text, 500) && time(v.time) ? { version: 1, type: 'chat-delivery', senderId: v.senderId, text: sanitizeChat(v.text), time: v.time } : null

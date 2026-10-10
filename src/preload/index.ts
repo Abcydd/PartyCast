@@ -20,6 +20,10 @@ const api: PartyCastApi = {
     return () => ipcRenderer.removeListener('app:closing', listener)
   },
   closeReady: () => ipcRenderer.send('app:close-ready'),
+  relayHasKey: () => ipcRenderer.invoke('relay:has-key'),
+  relayImport: () => ipcRenderer.invoke('relay:import'),
+  relayCall: (call) => ipcRenderer.invoke('relay:call', call),
+  runHostHook: (phase) => ipcRenderer.invoke(phase === 'start' ? 'hook:start' : 'hook:stop'),
 }
 
 contextBridge.exposeInMainWorld('partycast', api)

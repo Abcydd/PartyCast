@@ -7,8 +7,11 @@ import { effectiveQuality, BITRATES, type EffectiveQuality, type Quality } from 
 import { PeerRateLimiter } from '../../shared/rate-limit'
 import { normalizeRoomCode } from '../../shared/room-code'
 import type { Settings } from '../../shared/settings'
+import { codecPreferenceOrder, pinnedHostMatches } from '../../shared/video-encoding'
 
 type Role = 'host' | 'viewer'
+export type NetworkOptions = { iceServers?: RTCIceServer[]; relayControl?: boolean; pinnedHostId?: string }
+export const localPeerId = (): string => selfId
 export type RoomEvents = {
   canJoin?(peerId: string): Admission
   onPeerConnecting?(peerId: string): void
@@ -26,6 +29,7 @@ export type PartyRoom = {
   send(message: Message, peerId?: string): Promise<void>
   setHostStream(stream: MediaStream | null): Promise<void>
   setQuality(quality: EffectiveQuality): Promise<void>
+  stats(): Promise<string>
   approvePeer(peerId: string): Promise<void>
   rejectPeer(peerId: string): void
   leave(): Promise<void>
@@ -38,7 +42,7 @@ export function iceConfiguration(settings: Settings): RTCConfiguration {
   return { iceServers, iceTransportPolicy: settings.relayOnly ? 'relay' : 'all' }
 }
 
-export function openPartyRoom(role: Role, code: string, settings: Settings, events: RoomEvents, quality: Quality = 'auto'): PartyRoom {
+export function openPartyRoom(role: Role, code: string, settings: Settings, events: RoomEvents, quality: Quality = 'auto', network: NetworkOptions = {}): PartyRoom {
   const normalized = normalizeRoomCode(code)
   const blocked = new Set<string>()
   const block = (peerId: string): void => {
@@ -53,9 +57,11 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
   let currentQuality: EffectiveQuality = effectiveQuality(quality, 0, settings.uploadMbps)
   let mediaTask: Promise<void> = Promise.resolve()
   let closed = false
+  let lastBytes = 0, lastTimestamp = 0
   const remoteStream = new MediaStream()
 
-  const room = joinRoom({ appId: 'partycast-v1', password: normalized, rtcConfig: iceConfiguration(settings) }, normalized, {
+  const rtcConfig = network.iceServers ? { iceServers: network.iceServers, iceTransportPolicy: role === 'host' && network.relayControl ? 'relay' as const : 'all' as const } : iceConfiguration(settings)
+  const room = joinRoom({ appId: 'partycast-v1', password: normalized, rtcConfig }, normalized, {
     handshakeTimeoutMs: 10000,
     onPeerHandshake: async (peerId, send, receive) => {
       events.onPeerConnecting?.(peerId)
@@ -67,7 +73,7 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
           events.onError?.(reply.status === 'full' ? 'room-full' : reply.status)
           throw new Error(reply.status)
         }
-        if (hostId && hostId !== peerId) throw new Error('Another host is already connected')
+        if (!pinnedHostMatches(peerId, network.pinnedHostId ?? null) || hostId && hostId !== peerId) throw new Error('Another host is already connected')
         hostId = peerId
         return
       }
@@ -148,10 +154,14 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
     const pc = room.getPeers()[peerId]
     const senderTracks = pc.getSenders().map(sender => sender.track)
     for (const track of currentStream.getTracks()) if (!senderTracks.includes(track)) await Promise.all(room.addTrack(track, currentStream, { target: peerId }))
+    const codecs = RTCRtpSender.getCapabilities('video')?.codecs
+    if (codecs) for (const transceiver of pc.getTransceivers()) if (transceiver.sender.track?.kind === 'video') {
+      try { transceiver.setCodecPreferences(codecPreferenceOrder(codecs)) } catch { /* Negotiated already. */ }
+    }
     await applyBitrate(peerId)
   }
   async function updateStream(stream: MediaStream | null): Promise<void> {
-    if (role !== 'host' || closed) return
+    if (role !== 'host' || closed || network.relayControl) return
     currentStream = stream
     for (const peerId of approved) {
       const pc = room.getPeers()[peerId]
@@ -178,7 +188,15 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
     },
     setHostStream(stream) { mediaTask = mediaTask.catch(() => {}).then(() => updateStream(stream)); return mediaTask },
     async setQuality(next) { currentQuality = next; await applyBitrate() },
-    async approvePeer(peerId) { if (role !== 'host' || !connected.has(peerId) || blocked.has(peerId)) return; approved.add(peerId); await mediaTask; await attach(peerId) },
+    async stats() {
+      const connection = Object.entries(room.getPeers()).find(([id]) => approved.has(id))?.[1]
+      if (!connection) return 'Waiting for an approved viewer'
+      const reports = await connection.getStats()
+      let codec = 'Negotiating', width = 0, height = 0, bitrate = 0
+      reports.forEach(report => { if (report.type === 'outbound-rtp' && report.kind === 'video') { width = report.frameWidth ?? width; height = report.frameHeight ?? height; const info = reports.get(report.codecId); if (info?.mimeType) codec = String(info.mimeType).replace(/^video\//, ''); if (lastTimestamp && report.timestamp > lastTimestamp) bitrate = (report.bytesSent - lastBytes) * 8 / (report.timestamp - lastTimestamp) / 1000; lastBytes = report.bytesSent; lastTimestamp = report.timestamp } })
+      return `${codec} · ${width || '?'}×${height || '?'} · ${bitrate.toFixed(2)} Mbps (${(BITRATES[currentQuality] / 1_000_000).toFixed(1)} cap)`
+    },
+    async approvePeer(peerId) { if (role !== 'host' || !connected.has(peerId) || blocked.has(peerId)) return; approved.add(peerId); if (!network.relayControl) { await mediaTask; await attach(peerId) } },
     rejectPeer(peerId) { block(peerId); approved.delete(peerId); connected.delete(peerId); room.getPeers()[peerId]?.close() },
     async leave() { closed = true; await room.leave() },
   }

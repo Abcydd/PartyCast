@@ -1,4 +1,5 @@
 import type { Settings } from './settings'
+import type { RelayCall } from '../main/relay-ipc'
 
 export type PickedSubtitle = { title: string; text: string }
 export type PickedMedia = { url: string; title: string; subtitle: PickedSubtitle | null }
@@ -11,4 +12,8 @@ export type PartyCastApi = {
   registerDroppedSubtitle(file: File): Promise<PickedSubtitle | null>
   onWindowClosing(callback: () => void): () => void
   closeReady(): void
+  relayHasKey(): Promise<boolean>
+  relayImport(): Promise<{ relayUrl: string } | null>
+  relayCall(call: RelayCall): Promise<{ status: number; body: unknown }>
+  runHostHook(phase: 'start' | 'stop'): Promise<{ ok: boolean; ran: boolean; message?: string }>
 }
