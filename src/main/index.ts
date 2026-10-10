@@ -1,10 +1,12 @@
-import { app, BrowserWindow, dialog, ipcMain, protocol } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, protocol, session } from 'electron'
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { randomUUID } from 'node:crypto'
-import { basename, extname, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { basename, extname, join, resolve, dirname, parse } from 'node:path'
 import { loadSettings, saveSettings } from './settings'
+import { readSubtitle } from './subtitle-file'
 import { parseRangeHeader } from './range'
 import type { PickedMedia } from '../shared/electron-api'
 
@@ -25,11 +27,13 @@ const contentTypes: Record<string, string> = {
   '.avi': 'video/x-msvideo',
 }
 
-function registerMedia(path: string): PickedMedia {
+async function registerMedia(path: string): Promise<PickedMedia> {
   const token = randomUUID()
   mediaFiles.clear()
   mediaFiles.set(token, path)
-  return { url: `partycast-media://video/${token}`, title: basename(path) }
+  const stem = parse(path).name
+  const subtitle = await readSubtitle(join(dirname(path), `${stem}.srt`)) ?? await readSubtitle(join(dirname(path), `${stem}.vtt`))
+  return { url: `partycast-media://video/${token}`, title: basename(path), subtitle }
 }
 
 function settingsPath(): string {
@@ -51,15 +55,38 @@ function createWindow(): void {
       sandbox: true,
       webSecurity: true,
       autoplayPolicy: 'no-user-gesture-required',
+      devTools: !app.isPackaged,
     },
   })
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', (event) => event.preventDefault())
+  let closing = false
+  window.on('close', event => {
+    if (closing) return
+    event.preventDefault()
+    window.webContents.send('app:closing')
+    setTimeout(() => { if (!window.isDestroyed()) { closing = true; window.close() } }, 1200)
+  })
+  const onCloseReady = (event: Electron.IpcMainEvent): void => {
+    if (event.sender !== window.webContents || window.isDestroyed()) return
+    closing = true
+    window.close()
+  }
+  ipcMain.on('app:close-ready', onCloseReady)
+  window.on('closed', () => ipcMain.off('app:close-ready', onCloseReady))
   if (process.env.ELECTRON_RENDERER_URL) void window.loadURL(process.env.ELECTRON_RENDERER_URL)
   else void window.loadFile(join(__dirname, '../renderer/index.html'))
 }
 
+if (process.env.PARTYCAST_QA === '1') {
+  app.commandLine.appendSwitch('mute-audio')
+  if (process.env.PARTYCAST_QA_PORT) app.commandLine.appendSwitch('remote-debugging-port', process.env.PARTYCAST_QA_PORT)
+  if (process.env.PARTYCAST_QA_PROFILE) app.setPath('userData', process.env.PARTYCAST_QA_PROFILE)
+}
+
 app.whenReady().then(() => {
+  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
+  session.defaultSession.setPermissionCheckHandler(() => false)
   protocol.handle('partycast-media', async (request) => {
     const token = new URL(request.url).pathname.slice(1)
     const path = mediaFiles.get(token)
@@ -70,8 +97,6 @@ app.whenReady().then(() => {
       const range = parseRangeHeader(request.headers.get('range'), info.size)
       const headers = new Headers({
         'Accept-Ranges': 'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Range',
         'Content-Type': contentTypes[extname(path).toLowerCase()] ?? 'application/octet-stream',
         'Cache-Control': 'no-store',
       })
@@ -92,19 +117,27 @@ app.whenReady().then(() => {
     }
   })
 
-  ipcMain.handle('settings:load', () => loadSettings(settingsPath()))
-  ipcMain.handle('settings:save', (_event, settings: unknown) =>
-    saveSettings(settingsPath(), settings as Parameters<typeof saveSettings>[1]),
-  )
-  ipcMain.handle('media:pick', async () => {
+  const trusted = (event: Electron.IpcMainInvokeEvent): boolean => {
+    const window = BrowserWindow.fromWebContents(event.sender)
+    if (!window || window.isDestroyed()) return false
+    const url = event.senderFrame?.url ?? ''
+    const builtUrl = pathToFileURL(join(__dirname, '../renderer/index.html')).href
+    const devUrl = process.env.ELECTRON_RENDERER_URL
+    return url === builtUrl || !!devUrl && (url === devUrl || url === `${devUrl.replace(/\/$/, '')}/`)
+  }
+  ipcMain.handle('settings:load', (event) => trusted(event) ? loadSettings(settingsPath()) : null)
+  ipcMain.handle('settings:save', (event, settings: unknown) => trusted(event) ? saveSettings(settingsPath(), settings) : null)
+  ipcMain.handle('media:pick', async (event) => {
+    if (!trusted(event)) return null
     const result = await dialog.showOpenDialog({
       properties: ['openFile'],
       filters: [{ name: 'Video files', extensions: ['mp4', 'm4v', 'webm', 'mov', 'mkv', 'avi'] }],
     })
     return result.canceled || !result.filePaths[0] ? null : registerMedia(result.filePaths[0])
   })
-  ipcMain.handle('media:drop', async (_event, input: unknown) => {
-    if (typeof input !== 'string') return null
+  ipcMain.handle('media:drop', async (event, input: unknown) => {
+    if (!trusted(event)) return null
+    if (typeof input !== 'string' || input.length > 32768) return null
     const path = resolve(input)
     if (!Object.hasOwn(contentTypes, extname(path).toLowerCase())) return null
     try {
@@ -113,6 +146,15 @@ app.whenReady().then(() => {
       return null
     }
     return registerMedia(path)
+  })
+  ipcMain.handle('subtitle:pick', async (event) => {
+    if (!trusted(event)) return null
+    const result = await dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'Subtitles', extensions: ['srt', 'vtt'] }] })
+    return result.canceled || !result.filePaths[0] ? null : readSubtitle(result.filePaths[0])
+  })
+  ipcMain.handle('subtitle:drop', async (event, input: unknown) => {
+    if (!trusted(event) || typeof input !== 'string' || input.length > 32768) return null
+    return readSubtitle(resolve(input))
   })
 
   createWindow()

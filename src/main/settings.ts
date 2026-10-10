@@ -11,7 +11,7 @@ export async function loadSettings(path: string): Promise<Settings> {
   }
 }
 
-export async function saveSettings(path: string, settings: Settings): Promise<Settings> {
+export async function saveSettings(path: string, settings: unknown): Promise<Settings> {
   const cleaned = sanitizeSettings(settings)
   await mkdir(dirname(path), { recursive: true })
   const temporary = `${path}.tmp`

@@ -9,6 +9,17 @@ const api: PartyCastApi = {
     const path = webUtils.getPathForFile(file)
     return path ? ipcRenderer.invoke('media:drop', path) : Promise.resolve(null)
   },
+  pickSubtitle: () => ipcRenderer.invoke('subtitle:pick'),
+  registerDroppedSubtitle: (file) => {
+    const path = webUtils.getPathForFile(file)
+    return path ? ipcRenderer.invoke('subtitle:drop', path) : Promise.resolve(null)
+  },
+  onWindowClosing: (callback) => {
+    const listener = (): void => callback()
+    ipcRenderer.on('app:closing', listener)
+    return () => ipcRenderer.removeListener('app:closing', listener)
+  },
+  closeReady: () => ipcRenderer.send('app:close-ready'),
 }
 
 contextBridge.exposeInMainWorld('partycast', api)

@@ -1,229 +1,185 @@
-import { joinRoom } from 'trystero'
+import { joinRoom, selfId } from 'trystero'
+import { parseHandshake } from '../../shared/handshake'
+import type { Admission } from '../../shared/host-session'
 import type { Message } from '../../shared/protocol'
-import { decodeMessage, encodeMessage } from '../../shared/protocol'
+import { decodeMessage, encodeMessage, isHostAllowedMessage, isViewerAllowedMessage } from '../../shared/protocol'
+import { effectiveQuality, BITRATES, type EffectiveQuality, type Quality } from '../../shared/quality'
+import { PeerRateLimiter } from '../../shared/rate-limit'
 import { normalizeRoomCode } from '../../shared/room-code'
 import type { Settings } from '../../shared/settings'
 
-export type Quality = 'low' | 'medium' | 'high' | 'source'
-export const BITRATES: Record<Quality, number> = {
-  low: 1_000_000,
-  medium: 2_500_000,
-  high: 5_000_000,
-  source: 8_000_000,
-}
-
 type Role = 'host' | 'viewer'
-type Handshake = { role: Role; status?: 'ok' | 'full' }
 export type RoomEvents = {
+  canJoin?(peerId: string): Admission
   onPeerConnecting?(peerId: string): void
+  onPeerRejected?(peerId: string): void
   onPeerJoin?(peerId: string): void
   onPeerLeave?(peerId: string): void
   onPeerState?(peerId: string, state: 'connecting' | 'connected' | 'failed'): void
   onMessage?(message: Message, peerId: string): void
   onStream?(stream: MediaStream, peerId: string): void
-  onError?(reason: 'room-full' | 'connection'): void
+  onAbuse?(peerId: string): void
+  onError?(reason: 'room-full' | 'locked' | 'banned' | 'connection'): void
 }
-
 export type PartyRoom = {
+  selfId: string
   send(message: Message, peerId?: string): Promise<void>
   setHostStream(stream: MediaStream | null): Promise<void>
-  setQuality(quality: Quality): Promise<void>
+  setQuality(quality: EffectiveQuality): Promise<void>
+  approvePeer(peerId: string): Promise<void>
   rejectPeer(peerId: string): void
   leave(): Promise<void>
 }
 
-export function openPartyRoom(
-  role: Role,
-  code: string,
-  settings: Settings,
-  events: RoomEvents,
-  quality: Quality = 'medium',
-): PartyRoom {
+// TURN stays behind this function so a later phase can supply short-lived credentials.
+export function iceConfiguration(settings: Settings): RTCConfiguration {
+  const iceServers: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
+  if (settings.turn.url) iceServers.push({ urls: settings.turn.url, username: settings.turn.username, credential: settings.turn.credential })
+  return { iceServers, iceTransportPolicy: settings.relayOnly ? 'relay' : 'all' }
+}
+
+export function openPartyRoom(role: Role, code: string, settings: Settings, events: RoomEvents, quality: Quality = 'auto'): PartyRoom {
   const normalized = normalizeRoomCode(code)
   const blocked = new Set<string>()
-  const pending = new Set<string>()
+  const block = (peerId: string): void => {
+    blocked.add(peerId)
+    if (blocked.size > 512) blocked.delete(blocked.values().next().value!)
+  }
+  const approved = new Set<string>()
   const connected = new Set<string>()
+  const limiter = new PeerRateLimiter()
   let hostId: string | null = null
   let currentStream: MediaStream | null = null
-  let sentTracks: MediaStreamTrack[] = []
-  let currentQuality = quality
+  let currentQuality: EffectiveQuality = effectiveQuality(quality, 0, settings.uploadMbps)
   let mediaTask: Promise<void> = Promise.resolve()
   let closed = false
   const remoteStream = new MediaStream()
-  const iceServers: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
-  if (settings.turn.url)
-    iceServers.push({
-      urls: settings.turn.url,
-      username: settings.turn.username,
-      credential: settings.turn.credential,
-    })
 
-  const room = joinRoom(
-    {
-      appId: 'partycast-v1',
-      password: normalized,
-      rtcConfig: { iceServers },
-    },
-    normalized,
-    {
-      handshakeTimeoutMs: 10000,
-      onPeerHandshake: async (peerId, send, receive) => {
-        events.onPeerConnecting?.(peerId)
-        if (role === 'viewer') {
-          await send({ role: 'viewer' })
-          const reply = (await receive()).data as Handshake
-          if (reply?.role !== 'host') throw new Error('Not a host')
-          if (reply.status === 'full') {
-            events.onError?.('room-full')
-            throw new Error('Room full')
-          }
-          if (hostId && hostId !== peerId) throw new Error('Another host is already connected')
-          hostId = peerId
-          return
+  const room = joinRoom({ appId: 'partycast-v1', password: normalized, rtcConfig: iceConfiguration(settings) }, normalized, {
+    handshakeTimeoutMs: 10000,
+    onPeerHandshake: async (peerId, send, receive) => {
+      events.onPeerConnecting?.(peerId)
+      if (role === 'viewer') {
+        await send({ role: 'viewer' })
+        const reply = parseHandshake((await receive()).data)
+        if (!reply || reply.role !== 'host') throw new Error('Not a host')
+        if (reply.status !== 'ok') {
+          events.onError?.(reply.status === 'full' ? 'room-full' : reply.status)
+          throw new Error(reply.status)
         }
-        const request = (await receive()).data as Handshake
-        if (request?.role !== 'viewer' || blocked.has(peerId)) throw new Error('Rejected peer')
-        if (connected.size + pending.size >= settings.maxViewers) {
-          await send({ role: 'host', status: 'full' })
-          throw new Error('Room full')
-        }
-        pending.add(peerId)
-        await send({ role: 'host', status: 'ok' })
-      },
-      onJoinError: ({ error, peerId }) => {
-        pending.delete(peerId)
-        if (role === 'viewer' && !closed && !/room full|not a host|another host/i.test(error))
-          events.onError?.('connection')
-      },
+        if (hostId && hostId !== peerId) throw new Error('Another host is already connected')
+        hostId = peerId
+        return
+      }
+      const request = parseHandshake((await receive()).data)
+      if (!request || request.role !== 'viewer' || blocked.has(peerId)) throw new Error('Rejected peer')
+      const admission = events.canJoin?.(peerId) ?? 'ok'
+      await send({ role: 'host', status: admission === 'room-full' || admission === 'closed' ? 'full' : admission })
+      if (admission !== 'ok') throw new Error(admission)
     },
-  )
-
+    onJoinError: ({ error, peerId }) => {
+      events.onPeerRejected?.(peerId)
+      if (role === 'viewer' && !closed && !/full|locked|banned|not a host|another host/i.test(error)) events.onError?.('connection')
+    },
+  })
   const action = room.makeAction<string>('control-v1')
-  action.onMessage = (raw, { peerId }) => {
-    if (blocked.has(peerId) || (role === 'viewer' && peerId !== hostId)) return
-    const message = decodeMessage(raw)
-    if (message) events.onMessage?.(message, peerId)
-  }
-  room.onPeerJoin = (peerId) => {
-    pending.delete(peerId)
-    if (blocked.has(peerId) || (role === 'viewer' && hostId !== peerId)) {
+
+  function violation(peerId: string): void {
+    if (limiter.violate(peerId) >= 3 && role === 'host') {
+      events.onAbuse?.(peerId)
+      block(peerId)
       room.getPeers()[peerId]?.close()
+    }
+  }
+  action.onMessage = (raw, { peerId }) => {
+    if (blocked.has(peerId) || role === 'viewer' && peerId !== hostId) return
+    const message = decodeMessage(raw)
+    if (!message || role === 'host' && !isViewerAllowedMessage(message) || role === 'viewer' && !isHostAllowedMessage(message)) { violation(peerId); return }
+    if (role === 'host' && !approved.has(peerId) && message.type !== 'hello') { violation(peerId); return }
+    const category = message.type === 'chat' ? 'chat' : message.type === 'reaction' ? 'reaction' : 'other'
+    const limit = limiter.check(peerId, category)
+    if (!limit.allowed) {
+      if (role === 'host' && limit.violations >= 3) { events.onAbuse?.(peerId); block(peerId); room.getPeers()[peerId]?.close() }
       return
     }
+    events.onMessage?.(message, peerId)
+  }
+  room.onPeerJoin = peerId => {
+    if (blocked.has(peerId) || role === 'viewer' && hostId !== peerId) { room.getPeers()[peerId]?.close(); return }
     connected.add(peerId)
     const connection = room.getPeers()[peerId]
     if (connection) {
-      const reportState = (): void => {
+      const report = (): void => {
         const state = connection.connectionState
-        events.onPeerState?.(
-          peerId,
-          state === 'failed' || state === 'disconnected' || state === 'closed'
-            ? 'failed'
-            : state === 'connected'
-              ? 'connected'
-              : 'connecting',
-        )
+        events.onPeerState?.(peerId, state === 'failed' || state === 'disconnected' || state === 'closed' ? 'failed' : state === 'connected' ? 'connected' : 'connecting')
       }
-      connection.addEventListener('connectionstatechange', reportState)
-      reportState()
+      connection.addEventListener('connectionstatechange', report)
+      report()
     }
     events.onPeerJoin?.(peerId)
-    if (role === 'host')
-      void mediaTask
-        .then(async () => {
-          const peerConnection = room.getPeers()[peerId]
-          if (!currentStream?.getTracks().length || !peerConnection) return
-          const senderTracks = peerConnection.getSenders().map((sender) => sender.track)
-          const missing = currentStream.getTracks().filter((track) => !senderTracks.includes(track))
-          await Promise.all(
-            missing.flatMap((track) => room.addTrack(track, currentStream!, { target: peerId })),
-          )
-          await applyBitrate(peerId)
-        })
-        .catch(() => events.onError?.('connection'))
   }
-  room.onPeerLeave = (peerId) => {
-    pending.delete(peerId)
-    connected.delete(peerId)
-    if (hostId === peerId) hostId = null
+  room.onPeerLeave = peerId => {
+    connected.delete(peerId); approved.delete(peerId); limiter.forget(peerId)
+    // Pin the first host identity for the lifetime of this viewer room.
     events.onPeerLeave?.(peerId)
   }
-  room.onPeerStream = (stream, peerId) => {
-    if (role === 'viewer' && peerId === hostId) events.onStream?.(stream, peerId)
-  }
+  room.onPeerStream = (stream, peerId) => { if (role === 'viewer' && peerId === hostId) events.onStream?.(stream, peerId) }
   room.onPeerTrack = (track, _stream, peerId) => {
     if (role !== 'viewer' || peerId !== hostId) return
-    for (const previous of remoteStream.getTracks().filter((item) => item.kind === track.kind))
-      remoteStream.removeTrack(previous)
+    for (const previous of remoteStream.getTracks().filter(item => item.kind === track.kind)) remoteStream.removeTrack(previous)
     remoteStream.addTrack(track)
     events.onStream?.(remoteStream, peerId)
   }
 
   async function applyBitrate(peerId?: string): Promise<void> {
     for (const [id, connection] of Object.entries(room.getPeers())) {
-      if (peerId && id !== peerId) continue
+      if (!approved.has(id) || peerId && id !== peerId) continue
       for (const sender of connection.getSenders()) {
         if (sender.track?.kind !== 'video') continue
         const parameters = sender.getParameters()
         if (!parameters.encodings?.length) parameters.encodings = [{}]
         parameters.encodings[0].maxBitrate = BITRATES[currentQuality]
-        try {
-          await sender.setParameters(parameters)
-        } catch {
-          /* Some encoders do not support a cap. */
-        }
+        try { await sender.setParameters(parameters) } catch { /* Encoder does not support the cap. */ }
       }
     }
   }
-
-  async function updateHostStream(stream: MediaStream | null): Promise<void> {
+  async function attach(peerId: string): Promise<void> {
+    if (!currentStream?.getTracks().length || !room.getPeers()[peerId] || !approved.has(peerId)) return
+    const pc = room.getPeers()[peerId]
+    const senderTracks = pc.getSenders().map(sender => sender.track)
+    for (const track of currentStream.getTracks()) if (!senderTracks.includes(track)) await Promise.all(room.addTrack(track, currentStream, { target: peerId }))
+    await applyBitrate(peerId)
+  }
+  async function updateStream(stream: MediaStream | null): Promise<void> {
     if (role !== 'host' || closed) return
-    const previous = currentStream
     currentStream = stream
-    if (!stream || !stream.getTracks().length) {
-      if (previous) room.removeStream(previous)
-      sentTracks = []
-      return
-    }
-    const nextTracks = stream.getTracks()
-    if (!previous || !sentTracks.length) {
-      await Promise.all(room.addStream(stream))
-    } else {
-      for (const kind of ['video', 'audio']) {
-        const oldTrack = sentTracks.find((track) => track.kind === kind)
-        const newTrack = nextTracks.find((track) => track.kind === kind)
-        if (oldTrack && newTrack && oldTrack !== newTrack)
-          await Promise.all(room.replaceTrack(oldTrack, newTrack))
-        else if (oldTrack && !newTrack) room.removeTrack(oldTrack)
-        else if (!oldTrack && newTrack) await Promise.all(room.addTrack(newTrack, stream))
+    for (const peerId of approved) {
+      const pc = room.getPeers()[peerId]
+      if (!pc) continue
+      for (const sender of pc.getSenders()) {
+        if (sender.track?.kind !== 'video' && sender.track?.kind !== 'audio') continue
+        const replacement = stream?.getTracks().find(track => track.kind === sender.track?.kind) ?? null
+        if (sender.track !== replacement) await sender.replaceTrack(replacement)
       }
+      await attach(peerId)
     }
-    sentTracks = nextTracks
-    await applyBitrate()
   }
-
   return {
+    selfId,
     async send(message, peerId) {
       if (closed) return
-      await action.send(encodeMessage(message), { target: peerId ?? null })
+      const raw = encodeMessage(message)
+      if (role === 'host') {
+        if (peerId) {
+          if (!approved.has(peerId) && message.type !== 'approval' && message.type !== 'kick') return
+          await action.send(raw, { target: peerId })
+        } else for (const id of approved) await action.send(raw, { target: id })
+      } else if (hostId && (!peerId || peerId === hostId) && isViewerAllowedMessage(message)) await action.send(raw, { target: hostId })
     },
-    setHostStream(stream) {
-      mediaTask = mediaTask.catch(() => {}).then(() => updateHostStream(stream))
-      return mediaTask
-    },
-    async setQuality(next) {
-      currentQuality = next
-      await applyBitrate()
-    },
-    rejectPeer(peerId) {
-      blocked.add(peerId)
-      pending.delete(peerId)
-      connected.delete(peerId)
-      room.getPeers()[peerId]?.close()
-    },
-    async leave() {
-      closed = true
-      await room.leave()
-    },
+    setHostStream(stream) { mediaTask = mediaTask.catch(() => {}).then(() => updateStream(stream)); return mediaTask },
+    async setQuality(next) { currentQuality = next; await applyBitrate() },
+    async approvePeer(peerId) { if (role !== 'host' || !connected.has(peerId) || blocked.has(peerId)) return; approved.add(peerId); await mediaTask; await attach(peerId) },
+    rejectPeer(peerId) { block(peerId); approved.delete(peerId); connected.delete(peerId); room.getPeers()[peerId]?.close() },
+    async leave() { closed = true; await room.leave() },
   }
 }

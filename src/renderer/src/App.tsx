@@ -17,7 +17,10 @@ import {
 } from 'lucide-react'
 import {
   createHostSession,
-  joinViewer,
+  requestViewer,
+  approveViewer,
+  admission,
+  setLocked,
   removeViewer,
   closeHostSession,
   setViewerConnection,
@@ -27,13 +30,18 @@ import { generateRoomCode, formatRoomCode, isRoomCode } from '../../shared/room-
 import type { Message, Participant } from '../../shared/protocol'
 import type { PickedMedia } from '../../shared/electron-api'
 import { defaultSettings, type Settings } from '../../shared/settings'
-import { openPartyRoom, BITRATES, type PartyRoom, type Quality, type RoomEvents } from '../net/signaling'
+import { openPartyRoom, type PartyRoom, type RoomEvents } from '../net/signaling'
+import { effectiveQuality, estimatedUploadMbps, type Quality } from '../../shared/quality'
+import { REACTIONS, type Reaction } from '../../shared/reactions'
+import { sanitizeChat } from '../../shared/text'
+import { cueAtTime, parseSubtitles, type Cue } from '../../shared/subtitles'
 
 type Mode = 'home' | 'host' | 'viewer'
 type ViewerStatus =
-  'connecting' | 'waiting' | 'playing' | 'paused' | 'host-left' | 'room-full' | 'kicked' | 'failed'
+  'connecting' | 'pending' | 'waiting' | 'playing' | 'paused' | 'host-left' | 'room-full' | 'kicked' | 'denied' | 'locked' | 'banned' | 'failed'
 
 const qualityLabels: Record<Quality, string> = {
+  auto: 'Auto · adapts to upload',
   low: 'Low · 1 Mbps',
   medium: 'Medium · 2.5 Mbps',
   high: 'High · 5 Mbps',
@@ -41,15 +49,22 @@ const qualityLabels: Record<Quality, string> = {
 }
 const viewerMessages: Record<ViewerStatus, string> = {
   connecting: 'Connecting…',
+  pending: 'Waiting for host to let you in',
   waiting: 'Waiting for host to pick a video',
   playing: 'Live with host',
   paused: 'Paused by host',
   'host-left': 'Host left',
   'room-full': 'Room full',
   kicked: 'Kicked',
+  denied: 'Host denied your request',
+  locked: 'Room locked',
+  banned: 'Banned from this room',
   failed: 'Could not connect (try TURN in settings)',
 }
-const terminalStatuses: ViewerStatus[] = ['host-left', 'room-full', 'kicked', 'failed']
+const terminalStatuses: ViewerStatus[] = ['host-left', 'room-full', 'kicked', 'denied', 'locked', 'banned', 'failed']
+
+type ChatLine = { key: number; text: string; senderId: string; time: number; system?: boolean }
+type FloatingReaction = { key: number; emoji: Reaction }
 
 function safeTime(value: number): number {
   return Number.isFinite(value) && value >= 0 ? value : 0
@@ -64,15 +79,26 @@ export function App(): React.JSX.Element {
   const [codeInput, setCodeInput] = useState('')
   const [roomCode, setRoomCode] = useState('')
   const [copied, setCopied] = useState(false)
-  const [quality, setQuality] = useState<Quality>('medium')
+  const [quality, setQuality] = useState<Quality>('auto')
   const [session, setSession] = useState<HostSession>(createHostSession(8))
-  const [pendingPeers, setPendingPeers] = useState<string[]>([])
+  const [connectingPeers, setConnectingPeers] = useState<string[]>([])
   const [media, setMedia] = useState<PickedMedia | null>(null)
   const [viewerStatus, setViewerStatus] = useState<ViewerStatus>('connecting')
   const [viewerState, setViewerState] = useState<Extract<Message, { type: 'state' }> | null>(null)
   const [roster, setRoster] = useState<Participant[]>([])
   const [viewerVolume, setViewerVolume] = useState(1)
   const [error, setError] = useState('')
+  const [chat, setChat] = useState<ChatLine[]>([])
+  const [chatDraft, setChatDraft] = useState('')
+  const [floating, setFloating] = useState<FloatingReaction[]>([])
+  const [subtitleCues, setSubtitleCues] = useState<Cue[]>([])
+  const [subtitleTitle, setSubtitleTitle] = useState('')
+  const [subtitleOffset, setSubtitleOffset] = useState(0)
+  const [subtitleText, setSubtitleText] = useState<string | null>(null)
+  const [subtitlesVisible, setSubtitlesVisible] = useState(true)
+  const [subtitleSize, setSubtitleSize] = useState<'S' | 'M' | 'L'>('M')
+  const [kickTarget, setKickTarget] = useState<string | null>(null)
+  const [hostName, setHostName] = useState('Host')
   const roomRef = useRef<PartyRoom | null>(null)
   const sessionRef = useRef<HostSession>(createHostSession(8))
   const mediaRef = useRef<PickedMedia | null>(null)
@@ -81,6 +107,16 @@ export function App(): React.JSX.Element {
   const viewerVideoRef = useRef<HTMLVideoElement>(null)
   const viewerFrameRef = useRef<HTMLDivElement>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const chatEndRef = useRef<HTMLDivElement>(null)
+  const lastCueRef = useRef<string | null>(null)
+
+  useEffect(() => { chatEndRef.current?.scrollIntoView({ block: 'end' }) }, [chat])
+  const addChat = (line: Omit<ChatLine, 'key'>): void => setChat(old => [...old.slice(-199), { ...line, key: Date.now() + Math.random() }])
+  const addReaction = (emoji: Reaction): void => {
+    const key = Date.now() + Math.random()
+    setFloating(old => [...old, { key, emoji }])
+    setTimeout(() => setFloating(old => old.filter(item => item.key !== key)), 2800)
+  }
 
   useEffect(() => {
     void window.partycast
@@ -92,13 +128,15 @@ export function App(): React.JSX.Element {
     if (viewerVideoRef.current) viewerVideoRef.current.volume = viewerVolume
   }, [viewerVolume, mode])
   useEffect(() => {
-    const close = (): void => {
-      if (roomRef.current && mode === 'host')
-        void roomRef.current.send({ version: 1, type: 'room-closed' }).catch(() => {})
-      void roomRef.current?.leave()
-    }
-    window.addEventListener('beforeunload', close)
-    return () => window.removeEventListener('beforeunload', close)
+    return window.partycast.onWindowClosing(() => {
+      const room = roomRef.current
+      roomRef.current = null
+      void (async () => {
+        if (room && mode === 'host') await room.send({ version: 1, type: 'room-closed' }).catch(() => {})
+        await room?.leave().catch(() => {})
+        window.partycast.closeReady()
+      })()
+    })
   }, [mode])
 
   const saveProfile = useCallback(
@@ -151,11 +189,15 @@ export function App(): React.JSX.Element {
     captureRef.current = null
     mediaRef.current = null
     setMedia(null)
-    setPendingPeers([])
+    setConnectingPeers([])
     setRoster([])
     setViewerState(null)
     setJoining(false)
     setError('')
+    setChat([])
+    setFloating([])
+    setSubtitleCues([])
+    setSubtitleText(null)
     sessionRef.current = closeHostSession(sessionRef.current)
     setMode('home')
   }, [])
@@ -165,17 +207,22 @@ export function App(): React.JSX.Element {
       setError('Enter your display name first.')
       return
     }
+    if (settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
     const code = generateRoomCode()
     const name = settings.displayName.trim()
+    setHostName(name)
     setError('')
     setRoomCode(code)
     sessionRef.current = createHostSession(settings.maxViewers)
     setSession(sessionRef.current)
     setMedia(null)
+    setChat([])
     mediaRef.current = null
     setMode('host')
     const events: RoomEvents = {
-      onPeerConnecting: (peerId) => setPendingPeers((old) => (old.includes(peerId) ? old : [...old, peerId])),
+      canJoin: peerId => admission(sessionRef.current, peerId),
+      onPeerConnecting: (peerId) => setConnectingPeers((old) => (old.includes(peerId) ? old : [...old.slice(-31), peerId])),
+      onPeerRejected: peerId => setConnectingPeers(old => old.filter(id => id !== peerId)),
       onPeerState: (peerId, connection) => {
         const listed = sessionRef.current.viewers.some((viewer) => viewer.peerId === peerId)
         sessionRef.current = setViewerConnection(sessionRef.current, peerId, connection)
@@ -183,30 +230,29 @@ export function App(): React.JSX.Element {
         if (listed) sendRoster(name)
       },
       onPeerJoin: (peerId) => {
-        setPendingPeers((old) => old.filter((id) => id !== peerId))
-        void roomRef.current?.send({ version: 1, type: 'hello', name, role: 'host' }, peerId).catch(() => {})
-        sendState(peerId)
+        setConnectingPeers((old) => old.filter((id) => id !== peerId))
       },
       onPeerLeave: (peerId) => {
-        setPendingPeers((old) => old.filter((id) => id !== peerId))
+        setConnectingPeers((old) => old.filter((id) => id !== peerId))
+        const viewer = sessionRef.current.viewers.find(p => p.peerId === peerId)
         sessionRef.current = removeViewer(sessionRef.current, peerId)
         setSession(sessionRef.current)
         sendRoster(name)
+        if (viewer) systemLine(`${viewer.name} left`)
       },
       onMessage: (message, peerId) => {
-        if (message.type !== 'hello' || message.role !== 'viewer') return
-        const joined = joinViewer(sessionRef.current, peerId, message.name)
-        if (!joined.accepted) {
-          void roomRef.current
-            ?.send({ version: 1, type: 'kick', reason: 'room-full' }, peerId)
-            .finally(() => roomRef.current?.rejectPeer(peerId))
-          return
+        if (message.type === 'hello' && message.role === 'viewer') {
+          if (admission(sessionRef.current, peerId) !== 'ok') { roomRef.current?.rejectPeer(peerId); return }
+          sessionRef.current = requestViewer(sessionRef.current, peerId, message.name)
+          setSession(sessionRef.current)
+          if (settings.autoAccept) void acceptViewer(peerId)
+        } else if (message.type === 'chat' && sessionRef.current.viewers.some(p => p.peerId === peerId)) {
+          deliverChat(peerId, message.text)
+        } else if (message.type === 'reaction' && sessionRef.current.viewers.some(p => p.peerId === peerId)) {
+          deliverReaction(peerId, message.emoji)
         }
-        sessionRef.current = joined.session
-        setSession(joined.session)
-        sendRoster(name)
-        sendState(peerId)
       },
+      onAbuse: peerId => { void kick(peerId, true) },
     }
     try {
       roomRef.current = openPartyRoom('host', code, settings, events, quality)
@@ -225,6 +271,7 @@ export function App(): React.JSX.Element {
       setError('Enter a valid 6-character room code.')
       return
     }
+    if (settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
     const code = formatRoomCode(codeInput)
     const name = settings.displayName.trim()
     setRoomCode(code)
@@ -232,13 +279,14 @@ export function App(): React.JSX.Element {
     setViewerStatus('connecting')
     setViewerState(null)
     setRoster([])
+    setChat([])
     setMode('viewer')
     let connected = false
     const events: RoomEvents = {
       onPeerJoin: (peerId) => {
         connected = true
         if (timeoutRef.current) clearTimeout(timeoutRef.current)
-        setViewerStatus('waiting')
+        setViewerStatus('pending')
         void roomRef.current
           ?.send({ version: 1, type: 'hello', name, role: 'viewer' }, peerId)
           .catch(() => {})
@@ -247,10 +295,13 @@ export function App(): React.JSX.Element {
         if (connected) setViewerStatus((status) => (terminalStatuses.includes(status) ? status : 'host-left'))
       },
       onMessage: (message) => {
-        if (message.type === 'state') {
+        if (message.type === 'approval') {
+          setViewerStatus(message.accepted ? 'waiting' : 'denied')
+        } else if (message.type === 'hello' && message.role === 'host') setHostName(message.name)
+        else if (message.type === 'state') {
           setViewerState(message)
           setViewerStatus((status) =>
-            terminalStatuses.includes(status)
+            terminalStatuses.includes(status) || status === 'pending'
               ? status
               : message.title
                 ? message.playing
@@ -260,8 +311,12 @@ export function App(): React.JSX.Element {
           )
         } else if (message.type === 'roster') setRoster(message.participants)
         else if (message.type === 'kick')
-          setViewerStatus(message.reason === 'room-full' ? 'room-full' : 'kicked')
+          setViewerStatus(message.reason === 'room-full' ? 'room-full' : message.reason)
         else if (message.type === 'room-closed') setViewerStatus('host-left')
+        else if (message.type === 'chat-delivery') addChat({ senderId: message.senderId, text: message.text, time: message.time })
+        else if (message.type === 'system') addChat({ senderId: '', text: message.text, time: message.time, system: true })
+        else if (message.type === 'reaction-display') addReaction(message.emoji)
+        else if (message.type === 'subtitle') setSubtitleText(message.text)
       },
       onStream: (stream) => {
         const video = viewerVideoRef.current
@@ -271,7 +326,7 @@ export function App(): React.JSX.Element {
         }
       },
       onError: (reason) => {
-        if (reason === 'room-full') setViewerStatus('room-full')
+        if (reason !== 'connection') setViewerStatus(reason)
       },
     }
     try {
@@ -296,9 +351,39 @@ export function App(): React.JSX.Element {
     captureRef.current = null
     mediaRef.current = selected
     setMedia(selected)
+    loadSubtitle(selected.subtitle)
     setError('')
     sendState()
   }
+
+  const loadSubtitle = (file: { title: string; text: string } | null): void => {
+    setSubtitleCues(file ? parseSubtitles(file.text) : [])
+    setSubtitleTitle(file?.title ?? '')
+    setSubtitleText(null)
+    lastCueRef.current = null
+    void roomRef.current?.send({ version: 1, type: 'subtitle', text: null }).catch(() => {})
+  }
+  const pickSubtitle = async (dropped?: File): Promise<void> => {
+    const selected = dropped ? await window.partycast.registerDroppedSubtitle(dropped) : await window.partycast.pickSubtitle()
+    if (!selected) { if (dropped) setError('Choose a .srt or .vtt subtitle file up to 2 MB.'); return }
+    loadSubtitle(selected)
+    setError('')
+  }
+  const updateSubtitle = (): void => {
+    if (mode !== 'host') return
+    const cue = cueAtTime(subtitleCues, hostVideoRef.current?.currentTime ?? 0, subtitleOffset)?.text ?? null
+    if (cue !== lastCueRef.current) {
+      lastCueRef.current = cue
+      setSubtitleText(cue)
+      void roomRef.current?.send({ version: 1, type: 'subtitle', text: cue }).catch(() => {})
+    }
+  }
+  useEffect(() => {
+    if (mode !== 'host') return
+    updateSubtitle()
+    const timer = setInterval(updateSubtitle, 150)
+    return () => clearInterval(timer)
+  }, [mode, subtitleCues, subtitleOffset])
 
   const syncCapture = (): void => {
     const video = hostVideoRef.current
@@ -326,18 +411,63 @@ export function App(): React.JSX.Element {
     sendState()
   }
 
-  const kick = async (peerId: string): Promise<void> => {
-    await roomRef.current?.send({ version: 1, type: 'kick', reason: 'kicked' }, peerId).catch(() => {})
+  const systemLine = (text: string): void => {
+    const time = Date.now()
+    addChat({ senderId: '', text, time, system: true })
+    void roomRef.current?.send({ version: 1, type: 'system', text, time }).catch(() => {})
+  }
+  const acceptViewer = async (peerId: string): Promise<void> => {
+    const pending = sessionRef.current.pending.find(p => p.peerId === peerId)
+    if (!pending) return
+    sessionRef.current = approveViewer(sessionRef.current, peerId)
+    setSession(sessionRef.current)
+    await roomRef.current?.send({ version: 1, type: 'approval', accepted: true }, peerId).catch(() => {})
+    await roomRef.current?.approvePeer(peerId).catch(() => {})
+    void roomRef.current?.send({ version: 1, type: 'hello', name: settings?.displayName ?? 'Host', role: 'host' }, peerId).catch(() => {})
+    sendRoster(settings?.displayName ?? 'Host')
+    sendState(peerId)
+    void roomRef.current?.send({ version: 1, type: 'subtitle', text: lastCueRef.current }, peerId).catch(() => {})
+    systemLine(`${pending.name} joined`)
+  }
+  const kick = async (peerId: string, ban = false): Promise<void> => {
+    const person = sessionRef.current.viewers.find(p => p.peerId === peerId) ?? sessionRef.current.pending.find(p => p.peerId === peerId)
+    const pending = sessionRef.current.pending.some(p => p.peerId === peerId)
+    await roomRef.current?.send({ version: 1, type: 'kick', reason: pending ? 'denied' : 'kicked' }, peerId).catch(() => {})
     roomRef.current?.rejectPeer(peerId)
-    sessionRef.current = removeViewer(sessionRef.current, peerId)
+    sessionRef.current = removeViewer(sessionRef.current, peerId, ban)
     setSession(sessionRef.current)
     sendRoster(settings?.displayName || 'Host')
+    if (person) systemLine(`${person.name} was ${pending ? 'denied' : ban ? 'banned' : 'kicked'}`)
+    setKickTarget(null)
+  }
+
+  const deliverChat = (senderId: string, text: string): void => {
+    const time = Date.now()
+    const message: Message = { version: 1, type: 'chat-delivery', senderId, text, time }
+    addChat({ senderId, text, time })
+    void roomRef.current?.send(message).catch(() => {})
+  }
+  const deliverReaction = (senderId: string, emoji: Reaction): void => {
+    addReaction(emoji)
+    void roomRef.current?.send({ version: 1, type: 'reaction-display', senderId, emoji }).catch(() => {})
+  }
+  const submitChat = (): void => {
+    const text = sanitizeChat(chatDraft)
+    if (!text || mode === 'viewer' && (viewerStatus === 'pending' || terminalStatuses.includes(viewerStatus))) return
+    setChatDraft('')
+    if (mode === 'host') deliverChat('host', text)
+    else void roomRef.current?.send({ version: 1, type: 'chat', text }).catch(() => {})
+  }
+  const react = (emoji: Reaction): void => {
+    if (mode === 'host') deliverReaction('host', emoji)
+    else if (viewerStatus !== 'pending' && !terminalStatuses.includes(viewerStatus)) void roomRef.current?.send({ version: 1, type: 'reaction', emoji }).catch(() => {})
   }
 
   const applyQuality = (next: Quality): void => {
     setQuality(next)
-    void roomRef.current?.setQuality(next)
   }
+  const actualQuality = effectiveQuality(quality, session.viewers.length, settings?.uploadMbps ?? 6)
+  useEffect(() => { if (mode === 'host') void roomRef.current?.setQuality(actualQuality) }, [mode, actualQuality])
 
   const openSettings = (): void => {
     setDraftSettings(structuredClone(settings ?? defaultSettings))
@@ -355,6 +485,24 @@ export function App(): React.JSX.Element {
   }
 
   const name = settings?.displayName ?? ''
+  const chatPanel = (
+    <section className="sidebar-block chat-block">
+      <div className="sidebar-label">CHAT</div>
+      <div className="chat-lines" aria-live="polite">
+        {chat.map(line => <div className={`chat-line ${line.system ? 'system-line' : line.senderId === (mode === 'host' ? 'host' : roomRef.current?.selfId) ? 'own-line' : ''}`} key={line.key}>
+          {line.system ? <span dir="auto">{line.text}</span> : <><small dir="auto">{line.senderId === 'host' ? hostName : line.senderId === roomRef.current?.selfId ? 'You' : (mode === 'host' ? session.viewers : roster).find(p => p.peerId === line.senderId)?.name ?? 'Viewer'}{line.senderId === 'host' && <span className="host-pill">HOST</span>} · {new Date(line.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small><span dir="auto">{line.text}</span></>}
+        </div>)}
+        <div ref={chatEndRef} />
+      </div>
+      <form className="chat-form" onSubmit={event => { event.preventDefault(); submitChat() }}>
+        <input aria-label="Chat message" placeholder="Say something…" value={chatDraft} maxLength={500} onChange={event => setChatDraft(event.target.value)} disabled={mode === 'viewer' && (viewerStatus === 'pending' || terminalStatuses.includes(viewerStatus))} />
+        <button type="submit" className="button-subtle">Send</button>
+      </form>
+      <div className="reaction-bar">{REACTIONS.map(emoji => <button key={emoji} type="button" title={`React ${emoji}`} onClick={() => react(emoji)} disabled={mode === 'viewer' && (viewerStatus === 'pending' || terminalStatuses.includes(viewerStatus))}>{emoji}</button>)}</div>
+    </section>
+  )
+  const reactionOverlay = <div className="reaction-overlay" aria-hidden="true">{floating.map(item => <span className="floating-reaction" key={item.key}>{item.emoji}</span>)}</div>
+  const subtitleOverlay = subtitlesVisible && subtitleText && <div className={`subtitle-overlay subtitle-${subtitleSize.toLowerCase()}`} dir="auto">{subtitleText}</div>
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -390,7 +538,7 @@ export function App(): React.JSX.Element {
             <label htmlFor="display-name">YOUR DISPLAY NAME</label>
             <input
               id="display-name"
-              maxLength={40}
+              maxLength={32}
               placeholder="What should friends call you?"
               value={name}
               onChange={(event) =>
@@ -494,9 +642,11 @@ export function App(): React.JSX.Element {
               onDrop={(event) => {
                 event.preventDefault()
                 const file = event.dataTransfer.files[0]
-                if (file) void pickMedia(file)
+                if (file) void (/[.](srt|vtt)$/i.test(file.name) ? pickSubtitle(file) : pickMedia(file))
               }}
             >
+              <input className="file-fallback" type="file" accept="video/*,.mkv,.avi" aria-label="Select video file" onChange={event => { const file = event.target.files?.[0]; if (file) void pickMedia(file) }} />
+              <input className="file-fallback" type="file" accept=".srt,.vtt" aria-label="Select subtitle file" onChange={event => { const file = event.target.files?.[0]; if (file) void pickSubtitle(file) }} />
               {media ? (
                 <video
                   ref={hostVideoRef}
@@ -510,6 +660,7 @@ export function App(): React.JSX.Element {
                   onPause={() => sendState()}
                   onSeeked={() => sendState()}
                   onEnded={() => sendState()}
+                  onTimeUpdate={updateSubtitle}
                   onError={() =>
                     setError('This file could not be played. Try an MP4 or WebM with a supported codec.')
                   }
@@ -534,6 +685,8 @@ export function App(): React.JSX.Element {
                   <span>MP4, WEBM, MOV, MKV, AVI · CODEC SUPPORT VARIES</span>
                 </div>
               )}
+              {reactionOverlay}
+              {subtitleOverlay}
             </div>
             <div className="player-footer">
               <div className="media-title">
@@ -557,6 +710,11 @@ export function App(): React.JSX.Element {
                   <Plus size={16} /> Change video
                 </button>
               )}
+            </div>
+            <div className="subtitle-controls">
+              <button className="button-subtle" onClick={() => { void pickSubtitle() }}>Load subtitles…</button>
+              {subtitleTitle && <><span dir="auto">{subtitleTitle}</span><button className="button-subtle" onClick={() => loadSubtitle(null)}>Remove</button><button className="button-subtle" onClick={() => setSubtitleOffset(v => v - 0.5)}>−0.5 s</button><span>{subtitleOffset.toFixed(1)} s</span><button className="button-subtle" onClick={() => setSubtitleOffset(v => v + 0.5)}>+0.5 s</button></>}
+              <button className="button-subtle" onClick={() => setSubtitlesVisible(v => !v)}>{subtitlesVisible ? 'Hide' : 'Show'} subtitles</button>
             </div>
             {error && (
               <p className="error-text" role="alert">
@@ -584,6 +742,8 @@ export function App(): React.JSX.Element {
                 </button>
               </div>
               <div className="code-note">{copied ? 'Copied to clipboard' : 'Code is case insensitive'}</div>
+              <label className="toggle-line"><input type="checkbox" checked={session.locked} onChange={event => { sessionRef.current = setLocked(sessionRef.current, event.target.checked); setSession(sessionRef.current) }} /> Lock room</label>
+              {!settings?.relayOnly && <p className="privacy-note">Your IP is visible to viewers you accept.</p>}
             </section>
             <section className="sidebar-block">
               <div className="sidebar-label">STREAM QUALITY</div>
@@ -599,8 +759,7 @@ export function App(): React.JSX.Element {
                 ))}
               </select>
               <p className="bandwidth-note">
-                Host upload needed ≈ {((BITRATES[quality] * session.viewers.length) / 1_000_000).toFixed(1)}{' '}
-                Mbps for {session.viewers.length} viewer{session.viewers.length === 1 ? '' : 's'}.
+                Using ~{estimatedUploadMbps(actualQuality, session.viewers.length).toFixed(1)} Mbps of your {settings?.uploadMbps ?? 6} Mbps upload ({actualQuality}).
               </p>
             </section>
             <section className="sidebar-block participants-block">
@@ -625,7 +784,7 @@ export function App(): React.JSX.Element {
                   <div className="participant" key={viewer.peerId}>
                     <span className="avatar">{viewer.name.charAt(0).toUpperCase()}</span>
                     <span className="participant-main">
-                      <strong>{viewer.name}</strong>
+                      <strong dir="auto">{viewer.name}</strong>
                       <small>{viewer.connection === 'connected' ? 'Connected' : viewer.connection}</small>
                     </span>
                     <button
@@ -633,32 +792,36 @@ export function App(): React.JSX.Element {
                       title={`Kick ${viewer.name}`}
                       aria-label={`Kick ${viewer.name}`}
                       onClick={() => {
-                        void kick(viewer.peerId)
+                        setKickTarget(viewer.peerId)
                       }}
                     >
                       <X size={16} />
                     </button>
                   </div>
                 ))}
-                {pendingPeers.map((peerId) => (
-                  <div className="participant" key={peerId}>
+                {session.pending.map((person) => (
+                  <div className="participant pending-participant" key={person.peerId}>
                     <span className="avatar">·</span>
                     <span className="participant-main">
-                      <strong>Connecting…</strong>
-                      <small>Establishing connection</small>
+                      <strong dir="auto">{person.name}</strong>
+                      <small>Waiting for approval</small>
                     </span>
+                    <button className="button-subtle" onClick={() => { void acceptViewer(person.peerId) }}>Accept</button>
+                    <button className="button-subtle" onClick={() => { void kick(person.peerId, true) }}>Deny</button>
                   </div>
                 ))}
+                {connectingPeers.map(peerId => <div className="participant" key={peerId}>Connecting…</div>)}
               </div>
-              {session.viewers.length === 0 && pendingPeers.length === 0 && (
+              {session.viewers.length === 0 && session.pending.length === 0 && connectingPeers.length === 0 && (
                 <p className="empty-participants">It's quiet in here. Share the code to invite friends.</p>
               )}
             </section>
             <div className="sidebar-status">
               <span className="status-pulse" /> {session.viewers.length} connected viewer
               {session.viewers.length === 1 ? '' : 's'}
-              {pendingPeers.length ? ` · ${pendingPeers.length} connecting` : ''}
+              {session.pending.length ? ` · ${session.pending.length} pending` : ''}
             </div>
+            {chatPanel}
           </aside>
         </main>
       )}
@@ -690,7 +853,9 @@ export function App(): React.JSX.Element {
                 void viewerFrameRef.current?.requestFullscreen()
               }}
             />
-            {(viewerStatus === 'connecting' ||
+            {reactionOverlay}
+            {subtitleOverlay}
+            {(viewerStatus === 'connecting' || viewerStatus === 'pending' ||
               viewerStatus === 'waiting' ||
               terminalStatuses.includes(viewerStatus)) && (
               <div className="viewer-overlay">
@@ -704,6 +869,7 @@ export function App(): React.JSX.Element {
                 {viewerStatus === 'waiting' && (
                   <p>The stream will appear here as soon as the host starts a video.</p>
                 )}
+                {viewerStatus === 'pending' && <p>The host will decide whether to admit you.</p>}
                 {terminalStatuses.includes(viewerStatus) && (
                   <button
                     className="button-subtle"
@@ -761,11 +927,13 @@ export function App(): React.JSX.Element {
           </div>
           <div className="viewer-roster">
             <Users size={16} />{' '}
-            {roster.length ? roster.map((person) => person.name).join(' · ') : 'Waiting for participants'}
+            {roster.length ? roster.map((person) => <span key={person.peerId} dir="auto">{person.name}{person.peerId === 'host' && <span className="host-pill">HOST</span>} · </span>) : 'Waiting for participants'}
           </div>
+          <div className="viewer-extras"><div className="subtitle-controls"><button className="button-subtle" onClick={() => setSubtitlesVisible(v => !v)}>{subtitlesVisible ? 'Subtitles on' : 'Subtitles off'}</button><select aria-label="Subtitle size" value={subtitleSize} onChange={event => setSubtitleSize(event.target.value as 'S' | 'M' | 'L')}><option>S</option><option>M</option><option>L</option></select></div>{chatPanel}</div>
         </main>
       )}
 
+      {kickTarget && <div className="modal-scrim"><div className="settings-modal" role="dialog" aria-modal="true" aria-label="Remove participant"><h2>Remove participant?</h2><p>Kick disconnects this viewer. Ban also blocks this peer ID for this room session.</p><div className="modal-actions"><button className="button-subtle" onClick={() => setKickTarget(null)}>Cancel</button><button className="button-subtle" onClick={() => { void kick(kickTarget) }}>Kick</button><button className="button-primary" onClick={() => { void kick(kickTarget, true) }}>Ban</button></div></div></div>}
       {settingsOpen && (
         <div
           className="modal-scrim"
@@ -801,6 +969,11 @@ export function App(): React.JSX.Element {
                   setDraftSettings((old) => ({ ...old, maxViewers: Number(event.target.value) }))
                 }
               />
+              <label className="toggle-line"><input type="checkbox" checked={draftSettings.autoAccept} onChange={event => setDraftSettings(old => ({ ...old, autoAccept: event.target.checked }))} /> Auto-accept viewers (off by default)</label>
+              <label htmlFor="upload-mbps">My upload speed (Mbps)</label>
+              <input id="upload-mbps" type="number" min="0.5" max="1000" step="0.5" value={draftSettings.uploadMbps} onChange={event => setDraftSettings(old => ({ ...old, uploadMbps: Number(event.target.value) }))} />
+              <label className="toggle-line"><input type="checkbox" checked={draftSettings.relayOnly} onChange={event => setDraftSettings(old => ({ ...old, relayOnly: event.target.checked }))} /> Hide my IP from viewers (relay only)</label>
+              {draftSettings.relayOnly && !draftSettings.turn.url && <p className="error-text">Relay-only needs a TURN server. Add one below before hosting or joining.</p>}
               <div className="settings-divider" />
               <div className="sidebar-label">OPTIONAL TURN SERVER</div>
               <p>Some networks need a TURN server to connect. Enter your own server details here.</p>
@@ -810,7 +983,7 @@ export function App(): React.JSX.Element {
                 placeholder="turn:example.com:3478"
                 value={draftSettings.turn.url}
                 onChange={(event) =>
-                  setDraftSettings((old) => ({ ...old, turn: { ...old.turn, url: event.target.value } }))
+                  setDraftSettings((old) => ({ ...old, turn: { ...old.turn, url: event.target.value }, relayOnly: old.turn.url || !/^(turns?):\S+$/i.test(event.target.value) ? old.relayOnly : true }))
                 }
               />
               <label htmlFor="turn-user">Username</label>
