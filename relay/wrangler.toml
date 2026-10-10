@@ -13,3 +13,19 @@ new_sqlite_classes = ["RelayState"]
 
 [vars]
 MONTHLY_CAP_GB = "900"
+
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+
+[ratelimits.simple]
+limit = 120
+period = 60
+
+[[ratelimits]]
+name = "CODE_RATE_LIMITER"
+namespace_id = "1002"
+
+[ratelimits.simple]
+limit = 30
+period = 60

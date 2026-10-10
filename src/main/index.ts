@@ -5,13 +5,16 @@ import { Readable } from 'node:stream'
 import { randomUUID } from 'node:crypto'
 import { pathToFileURL } from 'node:url'
 import { basename, extname, join, resolve, dirname, parse } from 'node:path'
-import { loadSettings, saveSettings } from './settings'
+import { loadSettings, saveSettings, saveHookSettings } from './settings'
+import { getQaOverrides } from './qa-guard'
+import { validateAndResolveHook } from './hook-configure'
 import { readSubtitle } from './subtitle-file'
 import { relayEndpoint } from './relay-ipc'
 import { getHostKey, importRelayConfig } from './relay-security'
 import { executeHook } from './hooks'
 import { parseRangeHeader } from './range'
 import type { PickedMedia } from '../shared/electron-api'
+import type { HookConfig } from '../shared/relay-config'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -81,10 +84,11 @@ function createWindow(): void {
   else void window.loadFile(join(__dirname, '../renderer/index.html'))
 }
 
-if (process.env.PARTYCAST_QA === '1') {
+const qa = getQaOverrides(app.isPackaged)
+if (qa.isQa) {
   app.commandLine.appendSwitch('mute-audio')
-  if (process.env.PARTYCAST_QA_PORT) app.commandLine.appendSwitch('remote-debugging-port', process.env.PARTYCAST_QA_PORT)
-  if (process.env.PARTYCAST_QA_PROFILE) app.setPath('userData', process.env.PARTYCAST_QA_PROFILE)
+  if (qa.qaPort) app.commandLine.appendSwitch('remote-debugging-port', qa.qaPort)
+  if (qa.qaProfile) app.setPath('userData', qa.qaProfile)
 }
 
 app.whenReady().then(() => {
@@ -130,6 +134,48 @@ app.whenReady().then(() => {
   }
   ipcMain.handle('settings:load', (event) => trusted(event) ? loadSettings(settingsPath()) : null)
   ipcMain.handle('settings:save', (event, settings: unknown) => trusted(event) ? saveSettings(settingsPath(), settings) : null)
+  ipcMain.handle('hook:configure', async (event, proposed: unknown) => {
+    if (!trusted(event)) return { ok: false, error: 'forbidden' }
+    if (!proposed || typeof proposed !== 'object') return { ok: false, error: 'invalid-request' }
+    const p = proposed as Record<string, unknown>
+    const window = BrowserWindow.fromWebContents(event.sender)
+    let newStartHook: HookConfig | undefined
+    let newStopHook: HookConfig | undefined
+
+    if ('hostStartHook' in p && p.hostStartHook !== undefined) {
+      const startRes = await validateAndResolveHook(p.hostStartHook)
+      if (!startRes.ok) return { ok: false, error: startRes.error }
+      if (startRes.resolved.executable) {
+        const argsPart = startRes.resolved.args.length > 0 ? ` ${startRes.resolved.args.join(' ')}` : ''
+        const message = `Allow PartyCast to run ${startRes.resolved.executable}${argsPart} when hosting starts?`
+        const choice = window
+          ? await dialog.showMessageBox(window, { type: 'question', buttons: ['Allow', 'Cancel'], defaultId: 1, cancelId: 1, title: 'PartyCast Hook Confirmation', message })
+          : await dialog.showMessageBox({ type: 'question', buttons: ['Allow', 'Cancel'], defaultId: 1, cancelId: 1, title: 'PartyCast Hook Confirmation', message })
+        if (choice.response !== 0) return { ok: false, error: 'user-rejected' }
+      }
+      newStartHook = startRes.resolved
+    }
+
+    if ('hostStopHook' in p && p.hostStopHook !== undefined) {
+      const stopRes = await validateAndResolveHook(p.hostStopHook)
+      if (!stopRes.ok) return { ok: false, error: stopRes.error }
+      if (stopRes.resolved.executable) {
+        const argsPart = stopRes.resolved.args.length > 0 ? ` ${stopRes.resolved.args.join(' ')}` : ''
+        const message = `Allow PartyCast to run ${stopRes.resolved.executable}${argsPart} when hosting stops?`
+        const choice = window
+          ? await dialog.showMessageBox(window, { type: 'question', buttons: ['Allow', 'Cancel'], defaultId: 1, cancelId: 1, title: 'PartyCast Hook Confirmation', message })
+          : await dialog.showMessageBox({ type: 'question', buttons: ['Allow', 'Cancel'], defaultId: 1, cancelId: 1, title: 'PartyCast Hook Confirmation', message })
+        if (choice.response !== 0) return { ok: false, error: 'user-rejected' }
+      }
+      newStopHook = stopRes.resolved
+    }
+
+    const updated = await saveHookSettings(settingsPath(), {
+      hostStartHook: newStartHook,
+      hostStopHook: newStopHook,
+    })
+    return { ok: true, settings: updated }
+  })
   ipcMain.handle('media:pick', async (event) => {
     if (!trusted(event)) return null
     const result = await dialog.showOpenDialog({
@@ -159,16 +205,16 @@ app.whenReady().then(() => {
     if (!trusted(event) || typeof input !== 'string' || input.length > 32768) return null
     return readSubtitle(resolve(input))
   })
-  ipcMain.handle('relay:has-key', async event => trusted(event) ? !!(await getHostKey()) || process.env.PARTYCAST_QA === '1' && !!process.env.PARTYCAST_QA_HOST_KEY : false)
+  ipcMain.handle('relay:has-key', async event => trusted(event) ? !!(await getHostKey()) || (qa.isQa && !!qa.qaHostKey) : false)
   ipcMain.handle('relay:import', event => trusted(event) ? importRelayConfig() : null)
   ipcMain.handle('relay:call', async (event, input: unknown) => {
     if (!trusted(event)) return { status: 403, body: { error: 'forbidden' } }
     const endpoint = relayEndpoint(input)
     if (!endpoint || endpoint.body && JSON.stringify(endpoint.body).length > 65536) return { status: 400, body: { error: 'invalid-request' } }
     const settings = await loadSettings(settingsPath())
-    const key = endpoint.host ? process.env.PARTYCAST_QA === '1' && process.env.PARTYCAST_QA_HOST_KEY || await getHostKey() : endpoint.ticket
+    const key = endpoint.host ? (qa.isQa && qa.qaHostKey || await getHostKey()) : endpoint.ticket
     if (endpoint.host && !key) return { status: 401, body: { error: 'missing-host-key' } }
-    const base = process.env.PARTYCAST_QA === '1' && process.env.PARTYCAST_QA_RELAY_URL || settings.relayUrl
+    const base = (qa.isQa && qa.qaRelayUrl) || settings.relayUrl
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 10000)
     try {
@@ -176,7 +222,7 @@ app.whenReady().then(() => {
       const raw = await response.text()
       if (raw.length > 65536) return { status: 502, body: { error: 'relay-response-too-large' } }
       const body = JSON.parse(raw) as unknown
-      if (process.env.PARTYCAST_QA === '1' && process.env.PARTYCAST_QA_CONTROL_DIRECT === '1' && endpoint.path === '/v1/turn' && response.ok)
+      if (qa.isQa && qa.qaControlDirect && endpoint.path === '/v1/turn' && response.ok)
         return { status: response.status, body: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], qaControlDirect: true } }
       return { status: response.status, body }
     } catch { return { status: 503, body: { error: 'relay-unavailable' } } }

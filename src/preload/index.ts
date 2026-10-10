@@ -4,6 +4,7 @@ import type { PartyCastApi } from '../shared/electron-api'
 const api: PartyCastApi = {
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
+  configureHook: (config) => ipcRenderer.invoke('hook:configure', config),
   pickMedia: () => ipcRenderer.invoke('media:pick'),
   registerDroppedFile: (file) => {
     const path = webUtils.getPathForFile(file)

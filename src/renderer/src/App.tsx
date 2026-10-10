@@ -597,6 +597,21 @@ export function App(): React.JSX.Element {
   const saveSettings = async (): Promise<void> => {
     try {
       if (!validRelayUrl(draftSettings.relayUrl)) { setError('Relay URL must be an HTTPS origin.'); return }
+      const currentHooks = settings ?? defaultSettings
+      const startChanged = draftSettings.hostStartHook.executable !== currentHooks.hostStartHook.executable ||
+        JSON.stringify(draftSettings.hostStartHook.args) !== JSON.stringify(currentHooks.hostStartHook.args)
+      const stopChanged = draftSettings.hostStopHook.executable !== currentHooks.hostStopHook.executable ||
+        JSON.stringify(draftSettings.hostStopHook.args) !== JSON.stringify(currentHooks.hostStopHook.args)
+      if (startChanged || stopChanged) {
+        const hookRes = await window.partycast.configureHook({
+          hostStartHook: startChanged ? draftSettings.hostStartHook : undefined,
+          hostStopHook: stopChanged ? draftSettings.hostStopHook : undefined,
+        })
+        if (!hookRes.ok) {
+          setError(hookRes.error === 'user-rejected' ? 'Hook execution not allowed.' : 'Invalid hook executable or arguments.')
+          return
+        }
+      }
       const saved = await window.partycast.saveSettings(draftSettings)
       setSettings(saved)
       setSettingsOpen(false)
