@@ -18,6 +18,7 @@ export type PartyCastApi = {
   onWindowClosing(callback: () => void): () => void
   closeReady(): void
   relayHasKey(): Promise<boolean>
+  relayDefaultUrl(): Promise<string>
   relayImport(): Promise<{ relayUrl: string } | null>
   relayCall(call: RelayCall): Promise<{ status: number; body: unknown }>
   runHostHook(phase: 'start' | 'stop'): Promise<{ ok: boolean; ran: boolean; message?: string }>

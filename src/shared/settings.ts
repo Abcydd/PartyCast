@@ -1,5 +1,5 @@
 import { sanitizeName } from './text'
-import { DEFAULT_RELAY_URL, validRelayUrl, validateHook, type HookConfig } from './relay-config'
+import { validRelayUrl, validateHook, type HookConfig } from './relay-config'
 
 export type Settings = {
   displayName: string
@@ -13,13 +13,16 @@ export type Settings = {
   turn: { url: string; username: string; credential: string }
 }
 
+// relayUrl is empty by default: the main process then falls back to the relay
+// URL baked in at build time (PARTYCAST_DEFAULT_RELAY_URL), so viewers need no
+// configuration. See effectiveRelayUrl in relay-config.ts.
 export const defaultSettings: Settings = {
   displayName: '',
   maxViewers: 8,
   autoAccept: false,
   uploadMbps: 6,
   relayOnly: false,
-  relayUrl: DEFAULT_RELAY_URL,
+  relayUrl: '',
   hostStartHook: { executable: '', args: [] },
   hostStopHook: { executable: '', args: [] },
   turn: { url: '', username: '', credential: '' },
@@ -35,7 +38,7 @@ export function sanitizeSettings(value: unknown): Settings {
     autoAccept: candidate.autoAccept === true,
     uploadMbps: typeof candidate.uploadMbps === 'number' && Number.isFinite(candidate.uploadMbps) ? Math.max(0.5, Math.min(1000, candidate.uploadMbps)) : 6,
     relayOnly: typeof candidate.relayOnly === 'boolean' ? candidate.relayOnly : typeof turn.url === 'string' && /^(turns?):\S+$/i.test(turn.url),
-    relayUrl: validRelayUrl(candidate.relayUrl) ? candidate.relayUrl.replace(/\/$/, '') : DEFAULT_RELAY_URL,
+    relayUrl: validRelayUrl(candidate.relayUrl) ? candidate.relayUrl.replace(/\/$/, '') : '',
     hostStartHook: validateHook(candidate.hostStartHook),
     hostStopHook: validateHook(candidate.hostStopHook),
     turn: {

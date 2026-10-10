@@ -24,6 +24,7 @@ const api: PartyCastApi = {
   },
   closeReady: () => ipcRenderer.send('app:close-ready'),
   relayHasKey: () => ipcRenderer.invoke('relay:has-key'),
+  relayDefaultUrl: async () => (await ipcRenderer.invoke('settings:relay-default')) ?? '',
   relayImport: () => ipcRenderer.invoke('relay:import'),
   relayCall: (call) => ipcRenderer.invoke('relay:call', call),
   runHostHook: (phase) => ipcRenderer.invoke(phase === 'start' ? 'hook:start' : 'hook:stop'),

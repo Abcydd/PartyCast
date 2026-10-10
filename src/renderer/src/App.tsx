@@ -110,6 +110,7 @@ export function App(): React.JSX.Element {
   const [kickTarget, setKickTarget] = useState<string | null>(null)
   const [hostName, setHostName] = useState('Host')
   const [hasRelayKey, setHasRelayKey] = useState(false)
+  const [relayDefaultUrl, setRelayDefaultUrl] = useState('')
   const [transportChoice, setTransportChoice] = useState<'relay' | 'direct'>('direct')
   const [relayQuality, setRelayQuality] = useState<RelayQuality>('1080p')
   const [streamStats, setStreamStats] = useState('')
@@ -146,6 +147,7 @@ export function App(): React.JSX.Element {
       .then(setSettings)
       .catch(() => setSettings(defaultSettings))
     void window.partycast.relayHasKey().then(value => { setHasRelayKey(value); if (value) setTransportChoice('relay') }).catch(() => {})
+    void window.partycast.relayDefaultUrl().then(setRelayDefaultUrl).catch(() => {})
   }, [])
   useEffect(() => {
     if (viewerVideoRef.current) viewerVideoRef.current.volume = viewerVolume
@@ -683,7 +685,7 @@ export function App(): React.JSX.Element {
   }
   const saveSettings = async (): Promise<void> => {
     try {
-      if (!validRelayUrl(draftSettings.relayUrl)) { setError('Relay URL must be an HTTPS origin.'); return }
+      if (draftSettings.relayUrl && !validRelayUrl(draftSettings.relayUrl)) { setError('Relay URL must be an HTTPS origin.'); return }
       const currentHooks = settings ?? defaultSettings
       const startChanged = draftSettings.hostStartHook.executable !== currentHooks.hostStartHook.executable ||
         JSON.stringify(draftSettings.hostStartHook.args) !== JSON.stringify(currentHooks.hostStartHook.args)
@@ -1197,7 +1199,8 @@ export function App(): React.JSX.Element {
               <div className="sidebar-label">CLOUDFLARE RELAY</div>
               <p>The host key stays encrypted on this computer. Viewers need no key.</p>
               <label htmlFor="relay-url">Relay URL (HTTPS)</label>
-              <input id="relay-url" value={draftSettings.relayUrl} onChange={event => setDraftSettings(old => ({ ...old, relayUrl: event.target.value }))} />
+              <input id="relay-url" placeholder={relayDefaultUrl || 'https://your-relay.example'} value={draftSettings.relayUrl} onChange={event => setDraftSettings(old => ({ ...old, relayUrl: event.target.value }))} />
+              <span className="settings-hint">Leave empty to use the built-in relay{relayDefaultUrl ? ` (${relayDefaultUrl})` : ''}. Viewers join with no configuration.</span>
               <button className="button-subtle" onClick={() => { void window.partycast.relayImport().then(async imported => { if (!imported) return; const loaded = await window.partycast.loadSettings(); setSettings(loaded); setDraftSettings(loaded); setHasRelayKey(true); setTransportChoice('relay'); setToast('Relay key imported securely.') }).catch(() => setToast('Could not import relay key file.')) }}>Import…</button>
               <span className="settings-hint">{hasRelayKey ? 'Host key stored securely' : 'No host key imported'}</span>
               {hasRelayKey && (relayUsage ? <UsageMeter usage={relayUsage} /> : usageFailed && <p className="usage-unavailable">Usage unavailable</p>)}

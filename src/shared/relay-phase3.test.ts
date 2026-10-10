@@ -15,7 +15,7 @@ describe('relay configuration and identity', () => {
     expect(validRelayUrl('https://relay.example')).toBe(true)
     expect(validRelayUrl('http://relay.example')).toBe(false)
     expect(validRelayUrl('https://user:pass@relay.example')).toBe(false)
-    expect(sanitizeSettings({ relayUrl: 'http://bad' }).relayUrl).toMatch(/^https:/)
+    expect(sanitizeSettings({ relayUrl: 'http://bad' }).relayUrl).toBe('')
     expect(validateHook({ executable: 'C:\\Program Files\\Docker\\docker.exe', args: ['pause', 'restic-restic-1'] })).toEqual({ executable: 'C:\\Program Files\\Docker\\docker.exe', args: ['pause', 'restic-restic-1'] })
     expect(validateHook({ executable: 'docker.exe', args: ['pause'] }).executable).toBe('')
     expect(validateHook({ executable: 'C:\\docker.exe', args: ['bad\narg'] }).args).toEqual([])

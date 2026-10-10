@@ -2,12 +2,19 @@ export type HookConfig = { executable: string; args: string[] }
 export type RelayQuality = '1080p' | '1080p-high' | '720p'
 export const RELAY_BITRATES: Record<RelayQuality, number> = { '1080p': 4_500_000, '1080p-high': 6_000_000, '720p': 2_500_000 }
 export const RELAY_HEIGHT: Record<RelayQuality, number> = { '1080p': 1080, '1080p-high': 1080, '720p': 720 }
-export const DEFAULT_RELAY_URL = 'https://partycast-relay.abcyd.workers.dev'
 
 export function validRelayUrl(value: unknown): value is string {
   if (typeof value !== 'string' || value.length > 512) return false
   try { const url = new URL(value); return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/' }
   catch { return false }
+}
+// The relay URL actually used: a valid configured origin wins; otherwise the
+// build-time baked default (see electron.vite.config.ts) applies; empty only
+// when neither is a valid HTTPS origin. Pure so it can be unit tested.
+export function effectiveRelayUrl(configured: unknown, bakedDefault: unknown): string {
+  if (typeof configured === 'string' && validRelayUrl(configured)) return configured.replace(/\/$/, '')
+  if (typeof bakedDefault === 'string' && validRelayUrl(bakedDefault)) return bakedDefault.replace(/\/$/, '')
+  return ''
 }
 export function validateHook(value: unknown): HookConfig {
   if (!value || typeof value !== 'object') return { executable: '', args: [] }

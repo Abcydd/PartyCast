@@ -15,7 +15,7 @@ import { getHostKey, importRelayConfig } from './relay-security'
 import { executeHook } from './hooks'
 import { parseRangeHeader } from './range'
 import type { PickedMedia, EmbeddedSubtitleTrack } from '../shared/electron-api'
-import type { HookConfig } from '../shared/relay-config'
+import { effectiveRelayUrl, type HookConfig } from '../shared/relay-config'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -140,6 +140,7 @@ app.whenReady().then(() => {
     return url === builtUrl || !!devUrl && (url === devUrl || url === `${devUrl.replace(/\/$/, '')}/`)
   }
   ipcMain.handle('settings:load', (event) => trusted(event) ? loadSettings(settingsPath()) : null)
+  ipcMain.handle('settings:relay-default', event => trusted(event) ? effectiveRelayUrl('', __DEFAULT_RELAY_URL__) : null)
   ipcMain.handle('settings:save', (event, settings: unknown) => trusted(event) ? saveSettings(settingsPath(), settings) : null)
   ipcMain.handle('hook:configure', async (event, proposed: unknown) => {
     if (!trusted(event)) return { ok: false, error: 'forbidden' }
@@ -244,7 +245,9 @@ app.whenReady().then(() => {
     const settings = await loadSettings(settingsPath())
     const key = endpoint.host ? (qa.isQa && qa.qaHostKey || await getHostKey()) : endpoint.ticket
     if (endpoint.host && !key) return { status: 401, body: { error: 'missing-host-key' } }
-    const base = (qa.isQa && qa.qaRelayUrl) || settings.relayUrl
+    // Empty configured relay URL falls back to the build-time baked default, so
+    // viewers need no configuration. See effectiveRelayUrl in relay-config.
+    const base = (qa.isQa && qa.qaRelayUrl) || effectiveRelayUrl(settings.relayUrl, __DEFAULT_RELAY_URL__)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 10000)
     try {

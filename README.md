@@ -2,6 +2,18 @@
 
 PartyCast is an open-source Windows desktop app for watching a local video together. The host opens a file and plays it on their computer. Friends join with a short code. Direct mode sends a separate WebRTC stream to each viewer. Cloudflare relay mode sends one stream to Cloudflare Realtime SFU, which distributes it to approved viewers. There are no accounts or PartyCast-run servers.
 
+## Download & run
+
+Build the portable app with `npm run dist`. The result is a single, no-install executable at `release/PartyCast-<version>-portable.exe` — copy it anywhere (a USB stick works) and double-click. PartyCast is unsigned, so Windows SmartScreen may show "Windows protected your PC" on first launch: click **More info → Run anyway**. The first launch unpacks the app into a temporary folder, which takes a few seconds; repeat launches reuse the same folder and start faster. Muted launches and exit behavior are otherwise identical to a normal install. To remove PartyCast, delete the exe (and `%TEMP%\PartyCast` if present).
+
+The build bakes a default relay URL into the executable so viewers can join with no settings at all. Set the `PARTYCAST_DEFAULT_RELAY_URL` environment variable to a bare `https://` origin when building (empty or unset means no baked default, and hosts must enter the relay URL in Settings). The build fails with a clear error for any value that is not a bare HTTPS origin — only the URL is baked in, never a key or secret:
+
+```sh
+PARTYCAST_DEFAULT_RELAY_URL=https://your-worker.example npm run dist
+```
+
+In the app, the Settings field shows the baked default as placeholder text; leave it empty to use it, or enter your own `https://` origin to override it per machine.
+
 ## Development
 
 Install Node.js 24, then run:
@@ -23,11 +35,11 @@ In Direct mode, host upload bandwidth is roughly the chosen bitrate times the nu
 
 ## Cloudflare relay mode
 
-Import a file in Settings containing `PARTYCAST_RELAY_URL=https://your-worker.example` and `PARTYCAST_HOST_KEY=<your-random-key>`. Choose the file explicitly with **Import…**; PartyCast never searches your disk for it. The host key is encrypted with Electron safeStorage in userData and only the main process sends it to the Worker. The default relay URL points to the PartyCast Worker, but **you must deploy and configure a Worker and import its host key before hosting in relay mode**. Viewers need the relay URL in Settings but no host key. Relay mode is selected by default when a host key is imported; Direct stays available.
+Import a file in Settings containing `PARTYCAST_RELAY_URL=https://your-worker.example` and `PARTYCAST_HOST_KEY=<your-random-key>`. Choose the file explicitly with **Import…**; PartyCast never searches your disk for it. The host key is encrypted with Electron safeStorage in userData and only the main process sends it to the Worker. The default relay URL is the one baked in at build time (`PARTYCAST_DEFAULT_RELAY_URL`), so viewers need no configuration and no host key; a portable build made without the variable requires both host and viewers to enter the relay URL in Settings. Relay mode is selected by default when a host key is imported; Direct stays available.
 
 The Worker gives the host a room code and short-lived TURN credentials for the host's control connection. It pins the host's Trystero peer ID for viewers and issues a viewer ticket only after host approval. Kick revokes that ticket for the room session. The host sends one WebRTC stream to Cloudflare Realtime SFU. The SFU distributes it to approved viewers. The host's IP is not exposed to viewers through the media or control connection in relay mode. Cloudflare sees connection metadata and carries media. Viewer IP privacy is outside this phase. A viewer's code lookup must reach the configured Worker; only a confirmed 404 falls back to Direct mode.
 
-To deploy your own relay, create a **Realtime TURN key** and a **Realtime SFU app** in the Cloudflare dashboard. Generate a long random `HOST_KEY` and keep it private. In `relay/`, run `npm install`, then set the five Worker secrets with `npx wrangler secret put TURN_KEY_ID`, `TURN_API_TOKEN`, `SFU_APP_ID`, `SFU_APP_SECRET`, and `HOST_KEY` (one command per secret). Run `npx wrangler deploy` after review. The `v1` Wrangler migration creates the SQLite-backed `RelayState` Durable Object; use the same class and migration tag on subsequent deploys. Set your Worker HTTPS URL in the host import file and in every viewer's Settings. `relay/.dev.vars.example` is for local development only. Never commit `.dev.vars` or a real host key. The Worker has no CORS wildcard because all requests are made by Electron's main process.
+To deploy your own relay, create a **Realtime TURN key** and a **Realtime SFU app** in the Cloudflare dashboard. Generate a long random `HOST_KEY` and keep it private. In `relay/`, run `npm install`, then set the five Worker secrets with `npx wrangler secret put TURN_KEY_ID`, `TURN_API_TOKEN`, `SFU_APP_ID`, `SFU_APP_SECRET`, and `HOST_KEY` (one command per secret). Run `npx wrangler deploy` after review. The `v1` Wrangler migration creates the SQLite-backed `RelayState` Durable Object; use the same class and migration tag on subsequent deploys. Set your Worker HTTPS URL in the host import file; viewers use the baked-in default unless the build had none or they want a different Worker. `relay/.dev.vars.example` is for local development only. Never commit `.dev.vars` or a real host key. The Worker has no CORS wildcard because all requests are made by Electron's main process.
 
 The Worker estimates monthly SFU usage from each viewer's active pull time and configured stream bitrate. The default cap is 900 GB (`MONTHLY_CAP_GB`). New tickets are refused above the cap and active viewers are told to stop at their next heartbeat. This is an estimate, not Cloudflare's billing meter. Worker requests are limited per IP in memory to 120 per minute, so the limit resets when an isolate restarts. Rooms expire after 12 hours unless the host keeps heartbeating. The session's viewer admission limit still applies; the default is eight and Settings permits up to 32.
 
@@ -49,6 +61,6 @@ In Direct mode, accepted viewers may learn the host's IP address through WebRTC.
 - Room codes are used as Trystero's signaling password. Share them privately.
 - Streaming quality and connectivity depend on the host's upload speed, codec, network, public relay availability, and TURN availability.
 - Relay usage estimation is approximate, and SFU/TURN service availability and costs depend on your Cloudflare account. The host's control data channel still connects to each viewer, relayed through TURN.
-- The app has not yet been packaged as an installer; Windows NSIS and portable targets are configured for a later phase.
+- Windows ships as a single portable executable only (`npm run dist`); there is no installer yet. The executable is unsigned, so SmartScreen shows a warning on first launch.
 
 Licensed under MIT.
