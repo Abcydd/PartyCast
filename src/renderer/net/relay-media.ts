@@ -17,14 +17,37 @@ const description = (v: unknown, type: 'offer' | 'answer'): RTCSessionDescriptio
   if (!v || typeof v !== 'object' || !('type' in v) || !('sdp' in v) || v.type !== type || typeof v.sdp !== 'string') throw new RelayError(502, 'invalid-sdp')
   return { type, sdp: v.sdp }
 }
-async function gathered(pc: RTCPeerConnection): Promise<void> {
+// Cloudflare TURN hands out UDP, TCP and TLS URLs; Chromium keeps iceGatheringState at 'gathering'
+// while the slower TCP/TLS allocations are pending, so waiting for 'complete' alone can stall for
+// many seconds. Resolve on 'complete', on the end-of-candidates event, or once candidates have
+// stopped arriving for a short settle window.
+async function gathered(pc: RTCPeerConnection, settleMs = 600, timeoutMs = 10000): Promise<void> {
   if (pc.iceGatheringState === 'complete') return
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => { pc.removeEventListener('icegatheringstatechange', change); reject(new Error('ICE gathering timed out')) }, 10000)
-    const change = (): void => { if (pc.iceGatheringState === 'complete') { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', change); resolve() } }
+    let candidates = 0
+    let settle: ReturnType<typeof setTimeout> | undefined
+    const done = (error?: Error): void => {
+      clearTimeout(timer); clearTimeout(settle)
+      pc.removeEventListener('icegatheringstatechange', change)
+      pc.removeEventListener('icecandidate', candidate)
+      if (error) reject(error); else resolve()
+    }
+    const change = (): void => { if (pc.iceGatheringState === 'complete') done() }
+    const candidate = (event: RTCPeerConnectionIceEvent): void => {
+      if (!event.candidate) { done(); return }
+      candidates++
+      clearTimeout(settle)
+      settle = setTimeout(() => done(), settleMs)
+    }
+    const timer = setTimeout(() => (candidates > 0 ? done() : done(new Error('ICE gathering timed out'))), timeoutMs)
     pc.addEventListener('icegatheringstatechange', change)
+    pc.addEventListener('icecandidate', candidate)
   })
 }
+// RTCSessionDescription exposes type/sdp as prototype getters, which Electron's structured clone
+// drops, so it arrives in the main process as {} — always send a plain object over IPC.
+const plainDescription = (pc: RTCPeerConnection): RTCSessionDescriptionInit | null =>
+  pc.localDescription ? { type: pc.localDescription.type, sdp: pc.localDescription.sdp } : null
 function prioritizeVideo(transceiver: RTCRtpTransceiver): void {
   const codecs = RTCRtpSender.getCapabilities('video')?.codecs
   if (codecs) try { transceiver.setCodecPreferences(codecPreferenceOrder(codecs)) } catch { /* Browser fallback. */ }
@@ -85,7 +108,7 @@ export class RelayPublisher {
     this.sessionId = session.sessionId
     await pc.setLocalDescription(await pc.createOffer())
     await gathered(pc)
-    const published = await relayCall('hostTracks', { roomId: this.roomId, sessionId: this.sessionId, sessionDescription: pc.localDescription, tracks: transceivers.map(({ track, transceiver }) => ({ location: 'local', mid: transceiver.mid, trackName: track.kind })) })
+    const published = await relayCall('hostTracks', { roomId: this.roomId, sessionId: this.sessionId, sessionDescription: plainDescription(pc), tracks: transceivers.map(({ track, transceiver }) => ({ location: 'local', mid: transceiver.mid, trackName: track.kind })) })
     await pc.setRemoteDescription(description(published.sessionDescription, 'answer'))
     this.generation++
   }
@@ -151,7 +174,7 @@ export class RelayReceiver {
     await pc.setRemoteDescription(description(response.sessionDescription, 'offer'))
     await pc.setLocalDescription(await pc.createAnswer())
     await gathered(pc)
-    await relayCall('viewerRenegotiate', { sessionId, sessionDescription: pc.localDescription }, this.ticket)
+    await relayCall('viewerRenegotiate', { sessionId, sessionDescription: plainDescription(pc) }, this.ticket)
     this.pulled = true
   }
   async heartbeat(): Promise<void> {
