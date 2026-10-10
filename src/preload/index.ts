@@ -15,6 +15,8 @@ const api: PartyCastApi = {
     const path = webUtils.getPathForFile(file)
     return path ? ipcRenderer.invoke('subtitle:drop', path) : Promise.resolve(null)
   },
+  listEmbeddedSubtitles: () => ipcRenderer.invoke('subtitle:list-embedded'),
+  loadEmbeddedSubtitle: (index) => ipcRenderer.invoke('subtitle:load-embedded', index),
   onWindowClosing: (callback) => {
     const listener = (): void => callback()
     ipcRenderer.on('app:closing', listener)

@@ -28,13 +28,14 @@ import {
 } from '../../shared/host-session'
 import { generateRoomCode, formatRoomCode, isRoomCode } from '../../shared/room-code'
 import type { Message, Participant } from '../../shared/protocol'
-import type { PickedMedia } from '../../shared/electron-api'
+import type { PickedMedia, EmbeddedSubtitleTrack } from '../../shared/electron-api'
 import { defaultSettings, type Settings } from '../../shared/settings'
 import { openPartyRoom, localPeerId, type PartyRoom, type RoomEvents } from '../net/signaling'
 import { effectiveQuality, estimatedUploadMbps, type Quality } from '../../shared/quality'
 import { REACTIONS, type Reaction } from '../../shared/reactions'
 import { sanitizeChat } from '../../shared/text'
 import { cueAtTime, parseSubtitles, type Cue } from '../../shared/subtitles'
+import { trackLabel } from '../../shared/embedded-subtitles'
 import { RELAY_BITRATES, type RelayQuality, validRelayUrl } from '../../shared/relay-config'
 import { parseUsage, type RelayUsage } from '../../shared/usage'
 import { RelayPublisher, RelayReceiver, RelayError, relayCall } from '../net/relay-media'
@@ -97,11 +98,15 @@ export function App(): React.JSX.Element {
   const [chatDraft, setChatDraft] = useState('')
   const [floating, setFloating] = useState<FloatingReaction[]>([])
   const [subtitleCues, setSubtitleCues] = useState<Cue[]>([])
-  const [subtitleTitle, setSubtitleTitle] = useState('')
   const [subtitleOffset, setSubtitleOffset] = useState(0)
   const [subtitleText, setSubtitleText] = useState<string | null>(null)
   const [subtitlesVisible, setSubtitlesVisible] = useState(true)
   const [subtitleSize, setSubtitleSize] = useState<'S' | 'M' | 'L'>('M')
+  const [embeddedTracks, setEmbeddedTracks] = useState<EmbeddedSubtitleTrack[]>([])
+  const [embeddedBusy, setEmbeddedBusy] = useState(false)
+  const [subtitleSelection, setSubtitleSelection] = useState('off')
+  const [subtitleNotice, setSubtitleNotice] = useState('')
+  const [externalSubtitle, setExternalSubtitle] = useState<{ title: string; text: string } | null>(null)
   const [kickTarget, setKickTarget] = useState<string | null>(null)
   const [hostName, setHostName] = useState('Host')
   const [hasRelayKey, setHasRelayKey] = useState(false)
@@ -232,6 +237,11 @@ export function App(): React.JSX.Element {
     setFloating([])
     setSubtitleCues([])
     setSubtitleText(null)
+    setEmbeddedTracks([])
+    setExternalSubtitle(null)
+    setSubtitleSelection('off')
+    setSubtitleNotice('')
+    setEmbeddedBusy(false)
     setStreamStats('')
     sessionRef.current = closeHostSession(sessionRef.current)
     setMode('home')
@@ -435,22 +445,78 @@ export function App(): React.JSX.Element {
     mediaRef.current = selected
     setMedia(selected)
     loadSubtitle(selected.subtitle)
+    void refreshEmbeddedTracks(selected)
     setError('')
     sendState()
   }
 
   const loadSubtitle = (file: { title: string; text: string } | null): void => {
     setSubtitleCues(file ? parseSubtitles(file.text) : [])
-    setSubtitleTitle(file?.title ?? '')
     setSubtitleText(null)
     lastCueRef.current = null
     void roomRef.current?.send({ version: 1, type: 'subtitle', text: null }).catch(() => {})
   }
-  const pickSubtitle = async (dropped?: File): Promise<void> => {
+  const pickSubtitle = async (dropped?: File): Promise<{ title: string; text: string } | null> => {
     const selected = dropped ? await window.partycast.registerDroppedSubtitle(dropped) : await window.partycast.pickSubtitle()
-    if (!selected) { if (dropped) setError('Choose a .srt or .vtt subtitle file up to 2 MB.'); return }
+    if (!selected) { if (dropped) setError('Choose a .srt or .vtt subtitle file up to 2 MB.'); return null }
     loadSubtitle(selected)
+    setExternalSubtitle(selected)
+    setSubtitleSelection('file')
+    setSubtitleNotice('')
     setError('')
+    return selected
+  }
+  const selectEmbeddedTrack = async (index: number): Promise<void> => {
+    const source = mediaRef.current
+    setEmbeddedBusy(true)
+    setSubtitleNotice('')
+    try {
+      const loaded = await window.partycast.loadEmbeddedSubtitle(index)
+      if (mediaRef.current !== source) return
+      if (!loaded) { setSubtitleNotice('Could not load this subtitle track.'); return }
+      loadSubtitle(loaded)
+    } catch {
+      setSubtitleNotice('Could not load this subtitle track.')
+    } finally {
+      setEmbeddedBusy(false)
+    }
+  }
+  // Fetches the embedded tracks of the loaded video and picks a sensible
+  // default: auto-loaded external file, else Arabic, else English, else Off.
+  const refreshEmbeddedTracks = async (source: PickedMedia): Promise<void> => {
+    let tracks: EmbeddedSubtitleTrack[] = []
+    try { tracks = await window.partycast.listEmbeddedSubtitles() } catch { tracks = [] }
+    if (mediaRef.current !== source) return
+    setEmbeddedTracks(tracks)
+    setSubtitleNotice('')
+    if (source.subtitle) {
+      setExternalSubtitle(source.subtitle)
+      setSubtitleSelection('file')
+      return
+    }
+    const preferred = tracks.find((track) => track.textBased && track.language === 'ara') ??
+      tracks.find((track) => track.textBased && track.language === 'eng')
+    if (preferred) {
+      setSubtitleSelection(`emb:${preferred.index}`)
+      await selectEmbeddedTrack(preferred.index)
+    } else {
+      setSubtitleSelection('off')
+    }
+  }
+  const handleSubtitleSelect = async (value: string): Promise<void> => {
+    if (value === 'load-file') {
+      const previous = subtitleSelection
+      setSubtitleSelection('load-file')
+      const selected = await pickSubtitle()
+      if (!selected) setSubtitleSelection(previous)
+      return
+    }
+    setSubtitleSelection(value)
+    setSubtitleNotice('')
+    if (value === 'off') { loadSubtitle(null); return }
+    if (value === 'file') { if (externalSubtitle) loadSubtitle(externalSubtitle); return }
+    const match = /^emb:(\d+)$/.exec(value)
+    if (match) await selectEmbeddedTrack(Number(match[1]))
   }
   const updateSubtitle = (): void => {
     if (mode !== 'host') return
@@ -861,6 +927,34 @@ export function App(): React.JSX.Element {
                 </span>
               </div>
               {media && (
+                <div className="subtitle-controls">
+                  <label htmlFor="host-subtitle-track">Subtitles</label>
+                  <select
+                    id="host-subtitle-track"
+                    aria-label="Subtitles"
+                    value={subtitleSelection}
+                    disabled={embeddedBusy}
+                    onChange={(event) => { void handleSubtitleSelect(event.target.value) }}
+                  >
+                    <option value="off">Off</option>
+                    {embeddedTracks.filter((track) => track.textBased).map((track) => (
+                      <option key={track.index} value={`emb:${track.index}`}>{trackLabel(track)}</option>
+                    ))}
+                    {embeddedTracks.filter((track) => !track.textBased).map((track) => (
+                      <option key={track.index} value={`img:${track.index}`} disabled>{trackLabel(track)}</option>
+                    ))}
+                    {externalSubtitle && <option value="file" dir="auto">{externalSubtitle.title}</option>}
+                    <option value="load-file">Load file…</option>
+                  </select>
+                  {embeddedBusy && <span className="subtitle-busy">Loading…</span>}
+                  {subtitleNotice && <span className="subtitle-notice" role="status">{subtitleNotice}</span>}
+                  <button className="button-subtle" onClick={() => setSubtitleOffset(v => v - 0.5)}>−0.5 s</button>
+                  <span>{subtitleOffset.toFixed(1)} s</span>
+                  <button className="button-subtle" onClick={() => setSubtitleOffset(v => v + 0.5)}>+0.5 s</button>
+                  <button className="button-subtle" onClick={() => setSubtitlesVisible(v => !v)}>{subtitlesVisible ? 'Hide' : 'Show'} subtitles</button>
+                </div>
+              )}
+              {media && (
                 <button
                   className="button-subtle"
                   onClick={() => {
@@ -870,11 +964,6 @@ export function App(): React.JSX.Element {
                   <Plus size={16} /> Change video
                 </button>
               )}
-            </div>
-            <div className="subtitle-controls">
-              <button className="button-subtle" onClick={() => { void pickSubtitle() }}>Load subtitles…</button>
-              {subtitleTitle && <><span dir="auto">{subtitleTitle}</span><button className="button-subtle" onClick={() => loadSubtitle(null)}>Remove</button><button className="button-subtle" onClick={() => setSubtitleOffset(v => v - 0.5)}>−0.5 s</button><span>{subtitleOffset.toFixed(1)} s</span><button className="button-subtle" onClick={() => setSubtitleOffset(v => v + 0.5)}>+0.5 s</button></>}
-              <button className="button-subtle" onClick={() => setSubtitlesVisible(v => !v)}>{subtitlesVisible ? 'Hide' : 'Show'} subtitles</button>
             </div>
             {error && (
               <p className="error-text" role="alert">

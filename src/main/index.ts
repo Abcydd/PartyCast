@@ -9,11 +9,12 @@ import { loadSettings, saveSettings, saveHookSettings } from './settings'
 import { getQaOverrides } from './qa-guard'
 import { validateAndResolveHook } from './hook-configure'
 import { readSubtitle } from './subtitle-file'
+import { extractSubtitleTrack, listSubtitleTracks, trackLabel, validateEmbeddedIndex } from './embedded-subs'
 import { relayEndpoint } from './relay-ipc'
 import { getHostKey, importRelayConfig } from './relay-security'
 import { executeHook } from './hooks'
 import { parseRangeHeader } from './range'
-import type { PickedMedia } from '../shared/electron-api'
+import type { PickedMedia, EmbeddedSubtitleTrack } from '../shared/electron-api'
 import type { HookConfig } from '../shared/relay-config'
 
 protocol.registerSchemesAsPrivileged([
@@ -44,6 +45,12 @@ async function registerMedia(path: string): Promise<PickedMedia> {
 
 function settingsPath(): string {
   return join(app.getPath('userData'), 'settings.json')
+}
+
+// The single host-picked video; the renderer can never name a path itself.
+function currentMediaPath(): string | null {
+  const path = mediaFiles.values().next().value
+  return path ?? null
 }
 
 function createWindow(): void {
@@ -204,6 +211,29 @@ app.whenReady().then(() => {
   ipcMain.handle('subtitle:drop', async (event, input: unknown) => {
     if (!trusted(event) || typeof input !== 'string' || input.length > 32768) return null
     return readSubtitle(resolve(input))
+  })
+  // Embedded subtitle tracks of the currently registered host video only.
+  let embeddedListing: { videoPath: string; tracks: EmbeddedSubtitleTrack[] } | null = null
+  ipcMain.handle('subtitle:list-embedded', async (event) => {
+    if (!trusted(event)) return []
+    const path = currentMediaPath()
+    if (!path) return []
+    try {
+      const tracks = await listSubtitleTracks(path)
+      embeddedListing = { videoPath: path, tracks }
+      return tracks
+    } catch { return [] }
+  })
+  ipcMain.handle('subtitle:load-embedded', async (event, index: unknown) => {
+    if (!trusted(event)) return null
+    const path = currentMediaPath()
+    if (!path || !embeddedListing || embeddedListing.videoPath !== path) return null
+    const track = validateEmbeddedIndex(embeddedListing.tracks, index)
+    if (!track) return null
+    try {
+      const text = await extractSubtitleTrack(path, track.index)
+      return { title: trackLabel(track), text }
+    } catch { return null }
   })
   ipcMain.handle('relay:has-key', async event => trusted(event) ? !!(await getHostKey()) || (qa.isQa && !!qa.qaHostKey) : false)
   ipcMain.handle('relay:import', event => trusted(event) ? importRelayConfig() : null)

@@ -786,6 +786,12 @@ select:focus {
 .subtitle-overlay { position: absolute; pointer-events: none; bottom: 9%; left: 7%; right: 7%; z-index: 4; text-align: center; white-space: pre-line; color: white; font-weight: 700; text-shadow: 0 2px 4px black, 0 0 8px black; }
 .subtitle-s { font-size: 18px; } .subtitle-m { font-size: 25px; } .subtitle-l { font-size: 34px; }
 .subtitle-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; color: #b9c0d0; font-size: 12px; }
+.player-footer .subtitle-controls { margin: 0 16px 0 auto; justify-content: flex-end; }
+.subtitle-controls > label { color: #9b9cab; font-size: 11px; letter-spacing: .08em; }
+.subtitle-controls select { padding: 8px 12px; max-width: 250px; }
+.subtitle-busy { color: #af94ff; }
+.subtitle-notice { color: #ff9b9b; }
+@media (max-width: 1100px) { .player-footer { flex-wrap: wrap; gap: 10px; } .player-footer .subtitle-controls { margin: 0; } }
 .toggle-line { display: flex !important; align-items: center; gap: 8px; margin-top: 12px; }
 .toggle-line input { width: auto !important; }
 .privacy-note { color: #f4b26b; font-size: 12px; }
