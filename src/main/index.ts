@@ -3,7 +3,7 @@ import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { randomUUID } from 'node:crypto'
-import { pathToFileURL } from 'node:url'
+import { isOwnRendererUrl } from './renderer-url'
 import { basename, extname, join, resolve, dirname, parse } from 'node:path'
 import { loadSettings, saveSettings, saveHookSettings } from './settings'
 import { getQaOverrides } from './qa-guard'
@@ -53,6 +53,8 @@ function currentMediaPath(): string | null {
   return path ?? null
 }
 
+const appContents = new WeakSet<Electron.WebContents>()
+
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1320,
@@ -71,6 +73,7 @@ function createWindow(): void {
       devTools: !app.isPackaged,
     },
   })
+  appContents.add(window.webContents)
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', (event) => event.preventDefault())
   let closing = false
@@ -131,13 +134,17 @@ app.whenReady().then(() => {
     }
   })
 
+  // Only the main frame of a PartyCast window showing our own renderer may call IPC. Paths are compared
+  // after resolving them on disk, not as URL strings: the portable build runs from %TEMP%, which Windows
+  // may spell with an 8.3 short name (C:\Users\ABDULS~1\...), so an exact string match rejected every call.
   const trusted = (event: Electron.IpcMainInvokeEvent): boolean => {
     const window = BrowserWindow.fromWebContents(event.sender)
-    if (!window || window.isDestroyed()) return false
-    const url = event.senderFrame?.url ?? ''
-    const builtUrl = pathToFileURL(join(__dirname, '../renderer/index.html')).href
+    if (!window || window.isDestroyed() || !appContents.has(event.sender)) return false
+    if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) return false
+    const url = event.senderFrame.url
     const devUrl = process.env.ELECTRON_RENDERER_URL
-    return url === builtUrl || !!devUrl && (url === devUrl || url === `${devUrl.replace(/\/$/, '')}/`)
+    if (devUrl) return url === devUrl || url === `${devUrl.replace(/\/$/, '')}/`
+    return isOwnRendererUrl(url, join(__dirname, '../renderer/index.html'))
   }
   ipcMain.handle('settings:load', (event) => trusted(event) ? loadSettings(settingsPath()) : null)
   ipcMain.handle('settings:relay-default', event => trusted(event) ? effectiveRelayUrl('', __DEFAULT_RELAY_URL__) : null)
