@@ -36,7 +36,9 @@ import { REACTIONS, type Reaction } from '../../shared/reactions'
 import { sanitizeChat } from '../../shared/text'
 import { cueAtTime, parseSubtitles, type Cue } from '../../shared/subtitles'
 import { RELAY_BITRATES, type RelayQuality, validRelayUrl } from '../../shared/relay-config'
+import { parseUsage, type RelayUsage } from '../../shared/usage'
 import { RelayPublisher, RelayReceiver, RelayError, relayCall } from '../net/relay-media'
+import { UsageMeter } from './UsageMeter'
 
 type Mode = 'home' | 'host' | 'viewer'
 type ViewerStatus =
@@ -106,6 +108,8 @@ export function App(): React.JSX.Element {
   const [transportChoice, setTransportChoice] = useState<'relay' | 'direct'>('direct')
   const [relayQuality, setRelayQuality] = useState<RelayQuality>('1080p')
   const [streamStats, setStreamStats] = useState('')
+  const [relayUsage, setRelayUsage] = useState<RelayUsage | null>(null)
+  const [usageFailed, setUsageFailed] = useState(false)
   const [toast, setToast] = useState('')
   const [viewerRelay, setViewerRelay] = useState(false)
   const roomRef = useRef<PartyRoom | null>(null)
@@ -590,9 +594,26 @@ export function App(): React.JSX.Element {
     return () => clearInterval(timer)
   }, [mode])
 
+  const fetchUsage = useCallback(async (): Promise<void> => {
+    try {
+      const usage = parseUsage(await relayCall('usage', {}))
+      setRelayUsage(usage)
+      setUsageFailed(usage === null)
+    } catch {
+      setUsageFailed(true)
+    }
+  }, [])
+  useEffect(() => {
+    if (mode !== 'host' || !hasRelayKey || !relayRoomRef.current) return
+    void fetchUsage()
+    const timer = setInterval(() => { void fetchUsage() }, 60000)
+    return () => clearInterval(timer)
+  }, [mode, hasRelayKey, fetchUsage])
+
   const openSettings = (): void => {
     setDraftSettings(structuredClone(settings ?? defaultSettings))
     setSettingsOpen(true)
+    if (hasRelayKey) void fetchUsage()
   }
   const saveSettings = async (): Promise<void> => {
     try {
@@ -887,7 +908,7 @@ export function App(): React.JSX.Element {
             </section>
             <section className="sidebar-block">
               <div className="sidebar-label">STREAM QUALITY</div>
-              {relayRoomRef.current ? <><select aria-label="Relay quality" value={relayQuality} onChange={event => setRelayQuality(event.target.value as RelayQuality)}><option value="1080p">1080p · 4.5 Mbps</option><option value="1080p-high">1080p High · 6 Mbps</option><option value="720p">720p · 2.5 Mbps</option></select><p className="bandwidth-note">One upload: {(RELAY_BITRATES[relayQuality] / 1_000_000).toFixed(1)} Mbps, regardless of viewer count.</p></> : <><select aria-label="Stream quality" value={quality} onChange={event => applyQuality(event.target.value as Quality)}>{Object.entries(qualityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><p className="bandwidth-note">Using ~{estimatedUploadMbps(actualQuality, session.viewers.length).toFixed(1)} Mbps of your {settings?.uploadMbps ?? 6} Mbps upload ({actualQuality}).</p></>}
+              {relayRoomRef.current ? <><select aria-label="Relay quality" value={relayQuality} onChange={event => setRelayQuality(event.target.value as RelayQuality)}><option value="1080p">1080p · 4.5 Mbps</option><option value="1080p-high">1080p High · 6 Mbps</option><option value="720p">720p · 2.5 Mbps</option></select><p className="bandwidth-note">One upload: {(RELAY_BITRATES[relayQuality] / 1_000_000).toFixed(1)} Mbps, regardless of viewer count.</p>{hasRelayKey && (relayUsage ? <UsageMeter usage={relayUsage} compact /> : usageFailed && <p className="usage-unavailable">Usage unavailable</p>)}</> : <><select aria-label="Stream quality" value={quality} onChange={event => applyQuality(event.target.value as Quality)}>{Object.entries(qualityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><p className="bandwidth-note">Using ~{estimatedUploadMbps(actualQuality, session.viewers.length).toFixed(1)} Mbps of your {settings?.uploadMbps ?? 6} Mbps upload ({actualQuality}).</p></>}
               <p className="stream-stats">{streamStats}</p>
             </section>
             <section className="sidebar-block participants-block">
@@ -1090,6 +1111,7 @@ export function App(): React.JSX.Element {
               <input id="relay-url" value={draftSettings.relayUrl} onChange={event => setDraftSettings(old => ({ ...old, relayUrl: event.target.value }))} />
               <button className="button-subtle" onClick={() => { void window.partycast.relayImport().then(async imported => { if (!imported) return; const loaded = await window.partycast.loadSettings(); setSettings(loaded); setDraftSettings(loaded); setHasRelayKey(true); setTransportChoice('relay'); setToast('Relay key imported securely.') }).catch(() => setToast('Could not import relay key file.')) }}>Import…</button>
               <span className="settings-hint">{hasRelayKey ? 'Host key stored securely' : 'No host key imported'}</span>
+              {hasRelayKey && (relayUsage ? <UsageMeter usage={relayUsage} /> : usageFailed && <p className="usage-unavailable">Usage unavailable</p>)}
               <div className="settings-divider" />
               <div className="sidebar-label">HOST HOOKS</div>
               <p>Local commands run without a shell when hosting starts or stops. Use full executable paths.</p>
