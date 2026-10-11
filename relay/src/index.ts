@@ -355,8 +355,9 @@ export class RelayState {
           record.sessionId = created.sessionId; result = json(created)
         } else if (action === 'quality') {
           if (!exact(b, ['sessionId','quality']) || record.sessionId !== b.sessionId || !['auto','1080p','720p','480p'].includes(String(b.quality)) || !record.videoMids?.length || !room.hostSessionId) throw new HttpError('invalid-body', 400)
+          // An explicit pick stays on that layer (priorityOrdering none); only Auto lets the SFU step down under congestion.
           const preferredRid = b.quality === '720p' ? 'h' : b.quality === '480p' ? 'q' : 'f'
-          result = json(await this.sfu('PUT', `/sessions/${record.sessionId}/tracks/update`, { tracks: record.videoMids.map(mid => ({ location: 'remote', sessionId: room.hostSessionId, trackName: 'video', mid, simulcast: { preferredRid, priorityOrdering: 'asciibetical', ridNotAvailable: 'asciibetical' } })) }))
+          result = json(await this.sfu('PUT', `/sessions/${record.sessionId}/tracks/update`, { tracks: record.videoMids.map(mid => ({ location: 'remote', sessionId: room.hostSessionId, trackName: 'video', mid, simulcast: { preferredRid, priorityOrdering: b.quality === 'auto' ? 'asciibetical' : 'none', ridNotAvailable: 'asciibetical' } })) }))
         } else {
           const sessionMatches =
             record.sessionId === b.sessionId ||

@@ -217,7 +217,7 @@ describe('relay Worker authorization and routes', () => {
     clearSfuCalls()
     const changed = await request('/v1/sfu/viewer/quality', 'PUT', { sessionId, quality: '720p' }, ticket)
     expect(changed.status).toBe(200)
-    expect(getSfuCalls().at(-1)).toMatchObject({ method: 'PUT', path: `/sessions/${sessionId}/tracks/update`, payload: { tracks: [{ mid: '0', simulcast: { preferredRid: 'h' } }] } })
+    expect(getSfuCalls().at(-1)).toMatchObject({ method: 'PUT', path: `/sessions/${sessionId}/tracks/update`, payload: { tracks: [{ mid: '0', simulcast: { preferredRid: 'h', priorityOrdering: 'none' } }] } })
     expect((await request('/v1/sfu/viewer/quality', 'PUT', { sessionId, quality: '2160p' }, ticket)).status).toBe(400)
   })
 
