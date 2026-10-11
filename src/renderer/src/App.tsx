@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  ArrowUpRight,
   ArrowLeft,
   Check,
   Clapperboard,
@@ -819,7 +820,7 @@ export function App(): React.JSX.Element {
                 <strong>Host a party</strong>
                 <small>Pick a video and invite your friends</small>
               </span>
-              <span className="card-arrow">↗</span>
+              <span className="card-arrow"><ArrowUpRight size={18} /></span>
             </button>
             <button
               className="home-card secondary-card"
@@ -835,7 +836,7 @@ export function App(): React.JSX.Element {
                 <strong>Join with code</strong>
                 <small>Jump into a friend's room</small>
               </span>
-              <span className="card-arrow">↗</span>
+              <span className="card-arrow"><ArrowUpRight size={18} /></span>
             </button>
           </div>
           {hasRelayKey && <div className="transport-choice"><label htmlFor="transport-mode">HOST CONNECTION</label><select id="transport-mode" value={transportChoice} onChange={event => setTransportChoice(event.target.value as 'relay' | 'direct')}><option value="relay">Cloudflare relay (recommended · hides your IP · any number of friends)</option><option value="direct">Direct (your IP may be visible)</option></select></div>}

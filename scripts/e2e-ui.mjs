@@ -88,6 +88,8 @@ try {
   hostApp = await electron.launch(electronOptions(hostProfile))
   hostPage = await hostApp.firstWindow()
   hostPage.on('console', message => logs.host.push(message.text()))
+  await hostPage.locator('#display-name').waitFor()
+  assert(!/\p{Extended_Pictographic}/u.test(await hostPage.evaluate(() => document.body.innerText)), 'Home screen contains emoji characters')
   await hostPage.locator('#display-name').fill('Host')
   await hostPage.getByRole('button', { name: /Host a party/ }).click()
   await hostPage.waitForSelector('.code-box strong', { timeout: 20000 })
