@@ -826,3 +826,32 @@ select:focus {
 .usage-unavailable { margin: 10px 0 0; font-size: 11px; color: #797889; }
 .toast { position: fixed; top: 65px; right: 20px; z-index: 100; max-width: 360px; border: 1px solid #8a7453; border-radius: 10px; background: #292318; color: #ffe5bb; padding: 12px 16px; box-shadow: 0 10px 32px #0008; }
 .toast button { margin-left: 12px; border: 0; color: inherit; background: transparent; cursor: pointer; }
+.view-mode-switch { display: flex; justify-content: flex-end; gap: 4px; margin: 0 0 10px; }
+.view-mode-switch button { border: 1px solid #393746; border-radius: 7px; padding: 7px 11px; color: #c6c4d1; background: #171820; font-size: 11px; }
+.view-mode-switch button.active { border-color: #a98ff2; color: #eee8ff; background: #302747; }
+.media-preparing { position: absolute; z-index: 6; top: 16px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 12px; padding: 10px 13px; border: 1px solid #494153; border-radius: 8px; background: #171820ee; color: #e8e2f6; font-size: 12px; }
+.media-preparing progress { width: 130px; accent-color: #b69bff; }
+.app-shell[data-view-mode="cinema"] .room-layout { max-width: none; min-height: 100vh; grid-template-columns: minmax(0, 1fr) 330px; gap: 14px; padding: 12px; }
+.app-shell[data-view-mode="cinema"] .room-heading, .app-shell[data-view-mode="cinema"] .player-footer, .app-shell[data-view-mode="cinema"] .room-sidebar > :not(.chat-block) { display: none; }
+.app-shell[data-view-mode="cinema"] .room-sidebar { align-self: stretch; }
+.app-shell[data-view-mode="cinema"] .player-frame { width: 100%; height: calc(100vh - 24px); min-height: 0; aspect-ratio: auto; }
+.app-shell[data-view-mode="cinema"] .viewer-layout { max-width: none; display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 12px; padding: 12px; }
+.app-shell[data-view-mode="cinema"] .viewer-header { display: none; }
+.app-shell[data-view-mode="cinema"] .viewer-player { grid-column: 1; grid-row: 1; height: calc(100vh - 80px); min-height: 0; aspect-ratio: auto; }
+.app-shell[data-view-mode="cinema"] .viewer-controls { grid-column: 1; }
+.app-shell[data-view-mode="cinema"] .viewer-extras { grid-column: 2; grid-row: 1 / span 2; display: block; }
+.fullscreen-chat { position: absolute; z-index: 7; top: 12px; right: 12px; bottom: 12px; width: min(360px, 34vw); overflow: auto; border: 1px solid #ffffff25; border-radius: 12px; background: #11131be8; box-shadow: 0 14px 40px #0008; }
+.fullscreen-chat .chat-block { height: 100%; border: 0; background: transparent; }
+.fullscreen-exit { position: absolute; z-index: 11; top: 14px; left: 14px; }
+.app-shell.controls-hidden .fullscreen-exit { opacity: 0; pointer-events: none; transition: opacity .2s ease; }
+.media-preparing .button-subtle { padding: 6px 9px; font-size: 11px; }
+.player-frame:fullscreen .view-mode-switch, .viewer-player:fullscreen .view-mode-switch { display: none; }
+.app-shell.controls-hidden .player-controls { opacity: 0; pointer-events: none; transition: opacity .2s ease; }
+.app-shell:not(.controls-hidden) .player-controls { opacity: 1; transition: opacity .2s ease; }
+.player-frame:fullscreen .player-controls, .viewer-player:fullscreen .player-controls { z-index: 10; }
+.shortcut-help { position: absolute; z-index: 8; right: 18px; bottom: 76px; display: flex; flex-direction: column; gap: 7px; min-width: 220px; padding: 15px; border: 1px solid #454252; border-radius: 10px; background: #171820f5; color: #dedce8; box-shadow: 0 12px 34px #0009; font-size: 11px; }
+.shortcut-help strong { color: #c8b6ff; margin-bottom: 3px; }
+.shortcut-help-toggle { font-weight: 800; font-size: 15px; }
+.quality-picker { display: flex; gap: 6px; align-items: center; color: #a7a6b4; font-size: 11px; }
+.quality-picker select { padding: 6px 9px; font-size: 11px; }
+.drift-indicator { color: #87d7b8; font-size: 11px; white-space: nowrap; }

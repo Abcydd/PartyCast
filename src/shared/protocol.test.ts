@@ -14,6 +14,11 @@ describe('control protocol', () => {
       { version: 1, type: 'chat-delivery', senderId: 'p', text: 'hello', time: 123 },
       { version: 1, type: 'subtitle', text: 'hello' },
       { version: 1, type: 'system', text: 'Ada joined', time: 123 },
+      { version: 1, type: 'controls-enabled', enabled: true },
+      { version: 1, type: 'control-request', action: 'seek', currentTime: 20 },
+      { version: 1, type: 'control-request', action: 'pause' },
+      { version: 1, type: 'quality', quality: '720p' },
+      { version: 1, type: 'quality-enabled', enabled: true },
     ]
     for (const message of messages) expect(decodeMessage(encodeMessage(message))).toEqual(message)
   })
@@ -29,6 +34,12 @@ describe('control protocol', () => {
       '{"version":1,"type":"state","playing":true,"currentTime":1,"duration":5,"sentAt":-1,"title":null}',
       '{"version":1,"type":"roster","participants":[{"peerId":"x","name":"a","connection":"bogus"}]}',
       '{"version":1,"type":"reaction","emoji":"👍"}',
+      '{"version":1,"type":"controls-enabled","enabled":"yes"}',
+      '{"version":1,"type":"quality-enabled","enabled":"yes"}',
+      '{"version":1,"type":"control-request","action":"seek","currentTime":-1}',
+      '{"version":1,"type":"control-request","action":"seek","currentTime":"12"}',
+      '{"version":1,"type":"control-request","action":"hack"}',
+      '{"version":1,"type":"quality","quality":"2160p"}',
       'x'.repeat(4097),
     ]) {
       expect(decodeMessage(raw)).toBeNull()

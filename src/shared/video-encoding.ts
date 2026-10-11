@@ -36,3 +36,10 @@ export function resolutionScale(width: number, height: number, maxWidth = 1920, 
 export function pinnedHostMatches(peerId: string, pinnedHostId: string | null): boolean {
   return !pinnedHostId || peerId === pinnedHostId
 }
+
+/** Simulcast needs independent layers: H264/VP8 do that natively, VP9/AV1 only with scalabilityMode L1T*. Prefer the classic pair. */
+export function simulcastCodecOrder<T extends { mimeType: string }>(codecs: readonly T[]): T[] {
+  const order = ['H264', 'VP8', 'VP9', 'AV1', 'H265']
+  const rank = (codec: T): number => { const name = codecName(codec.mimeType); return name ? order.indexOf(name) : 99 }
+  return [...codecs].sort((a, b) => rank(a) - rank(b))
+}

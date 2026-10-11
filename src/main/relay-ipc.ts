@@ -4,7 +4,7 @@ import { validRelayUrl } from '../shared/relay-config'
 export type RelayOperation =
   | 'lookup' | 'roomCreate' | 'roomHeartbeat' | 'roomClose' | 'ticket' | 'revoke' | 'turn' | 'usage'
   | 'hostSession' | 'hostTracks' | 'hostRenegotiate' | 'hostClose'
-  | 'viewerSession' | 'viewerPull' | 'viewerRenegotiate' | 'viewerClose' | 'viewerHeartbeat'
+  | 'viewerSession' | 'viewerPull' | 'viewerRenegotiate' | 'viewerClose' | 'viewerHeartbeat' | 'viewerQuality'
 export type RelayCall = { operation: RelayOperation; payload: Record<string, unknown>; ticket?: string }
 const obj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
 const exact = (v: Record<string, unknown>, keys: string[]): boolean => Object.keys(v).every(k => keys.includes(k))
@@ -12,12 +12,12 @@ const id = (v: unknown): v is string => typeof v === 'string' && /^[a-zA-Z0-9_-]
 const roomId = (v: unknown): v is string => typeof v === 'string' && /^[a-f0-9-]{36}$/.test(v)
 const sdp = (v: unknown, type: 'offer' | 'answer'): boolean => obj(v) && exact(v, ['type','sdp']) && v.type === type && typeof v.sdp === 'string' && v.sdp.length > 0 && new TextEncoder().encode(v.sdp).length <= 32768
 const ticket = (v: unknown): v is string => typeof v === 'string' && v.length <= 1024 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(v)
-export function relayEndpoint(value: unknown): { path: string; method: 'GET' | 'POST' | 'DELETE'; host: boolean; body?: Record<string, unknown>; ticket?: string } | null {
+export function relayEndpoint(value: unknown): { path: string; method: 'GET' | 'POST' | 'DELETE' | 'PUT'; host: boolean; body?: Record<string, unknown>; ticket?: string } | null {
   if (!obj(value) || !exact(value, ['operation','payload','ticket']) || !obj(value.payload)) return null
   const p = value.payload, op = value.operation
-  const viewer = ['viewerSession','viewerPull','viewerRenegotiate','viewerClose','viewerHeartbeat'].includes(String(op))
+  const viewer = ['viewerSession','viewerPull','viewerRenegotiate','viewerClose','viewerHeartbeat','viewerQuality'].includes(String(op))
   if (viewer && !ticket(value.ticket) || !viewer && value.ticket !== undefined) return null
-  let path: string, method: 'GET' | 'POST' | 'DELETE' = 'POST', host = !viewer, send: Record<string, unknown> | undefined = p
+  let path: string, method: 'GET' | 'POST' | 'DELETE' | 'PUT' = 'POST', host = !viewer, send: Record<string, unknown> | undefined = p
   switch (op) {
     case 'lookup': if (!exact(p, ['code']) || typeof p.code !== 'string' || !isRoomCode(p.code)) return null; path = `/v1/rooms/by-code/${formatRoomCode(p.code).replace('-', '')}`; method = 'GET'; host = false; send = undefined; break
     case 'roomCreate': if (!exact(p, ['hostPeerId','bitrateMbps']) || !id(p.hostPeerId) || typeof p.bitrateMbps !== 'number' || !Number.isFinite(p.bitrateMbps) || p.bitrateMbps < 0.5 || p.bitrateMbps > 8) return null; path = '/v1/rooms'; break
@@ -33,6 +33,7 @@ export function relayEndpoint(value: unknown): { path: string; method: 'GET' | '
     case 'hostClose': if (!roomId(p.roomId) || !id(p.sessionId) || !exact(p, ['roomId','sessionId'])) return null; path = '/v1/sfu/host/close'; break
     case 'viewerSession': if (!exact(p, [])) return null; path = '/v1/sfu/viewer/session'; break
     case 'viewerPull': if (!id(p.sessionId) || !exact(p, ['sessionId'])) return null; path = '/v1/sfu/viewer/pull'; break
+    case 'viewerQuality': if (!id(p.sessionId) || !['auto','1080p','720p','480p'].includes(String(p.quality)) || !exact(p, ['sessionId','quality'])) return null; path = '/v1/sfu/viewer/quality'; method = 'PUT'; break
     case 'viewerRenegotiate': if (!id(p.sessionId) || !exact(p, ['sessionId','sessionDescription']) || !sdp(p.sessionDescription, 'answer')) return null; path = '/v1/sfu/viewer/renegotiate'; break
     case 'viewerClose': if (!id(p.sessionId) || !exact(p, ['sessionId'])) return null; path = '/v1/sfu/viewer/close'; break
     case 'viewerHeartbeat': if (!id(p.sessionId) || !exact(p, ['sessionId'])) return null; path = '/v1/sfu/viewer/heartbeat'; break

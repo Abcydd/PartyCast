@@ -1,5 +1,5 @@
 import { RELAY_BITRATES, RELAY_HEIGHT, type RelayQuality } from '../../shared/relay-config'
-import { resolutionScale } from '../../shared/video-encoding'
+import { resolutionScale, simulcastCodecOrder } from '../../shared/video-encoding'
 import { preferredVideoCodecs } from './video-codec'
 import type { RelayOperation } from '../../main/relay-ipc'
 
@@ -49,9 +49,9 @@ async function gathered(pc: RTCPeerConnection, settleMs = 600, timeoutMs = 10000
 // drops, so it arrives in the main process as {} — always send a plain object over IPC.
 const plainDescription = (pc: RTCPeerConnection): RTCSessionDescriptionInit | null =>
   pc.localDescription ? { type: pc.localDescription.type, sdp: pc.localDescription.sdp } : null
-async function prioritizeVideo(transceiver: RTCRtpTransceiver): Promise<void> {
+async function prioritizeVideo(transceiver: RTCRtpTransceiver, simulcast: boolean): Promise<void> {
   const codecs = RTCRtpSender.getCapabilities('video')?.codecs
-  if (codecs) try { transceiver.setCodecPreferences(await preferredVideoCodecs(codecs)) } catch { /* Browser fallback. */ }
+  if (codecs) try { transceiver.setCodecPreferences(simulcast ? simulcastCodecOrder(codecs) : await preferredVideoCodecs(codecs)) } catch { /* Browser fallback. */ }
 }
 async function capVideo(sender: RTCRtpSender, track: MediaStreamTrack, quality: RelayQuality): Promise<void> {
   track.contentHint = 'motion'
@@ -74,11 +74,14 @@ export class RelayPublisher {
   private audioSender: RTCRtpSender | null = null
   private streamTask: Promise<void> = Promise.resolve()
   private disposed = false
+  private simulcastEnabled: boolean
+  private lastStream: MediaStream | null = null
   private lastBytes = 0
   private lastTimestamp = 0
-  constructor(private roomId: string, private iceServers: RTCIceServer[], private quality: RelayQuality) {}
+  constructor(private roomId: string, private iceServers: RTCIceServer[], private quality: RelayQuality, simulcastEnabled = false) { this.simulcastEnabled = simulcastEnabled }
   setStream(stream: MediaStream): Promise<void> {
     if (this.disposed) return Promise.resolve()
+    this.lastStream = stream
     this.streamTask = this.streamTask.catch(() => {}).then(() => this.updateStream(stream))
     return this.streamTask
   }
@@ -98,14 +101,19 @@ export class RelayPublisher {
     const pc = new RTCPeerConnection({ iceServers: this.iceServers, iceTransportPolicy: 'relay' })
     this.pc = pc
     const transceivers = tracks.map(track => {
-      const transceiver = pc.addTransceiver(track, { direction: 'sendonly' })
+      const sendEncodings: Array<RTCRtpEncodingParameters & { scalabilityMode?: string }> = this.simulcastEnabled && track.kind === 'video' ? [
+        { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 4_500_000, scalabilityMode: 'L1T1' },
+        { rid: 'h', scaleResolutionDownBy: 1.5, maxBitrate: 1_500_000, scalabilityMode: 'L1T1' },
+        { rid: 'q', scaleResolutionDownBy: 2.25, maxBitrate: 600_000, scalabilityMode: 'L1T1' },
+      ] : [{}]
+      const transceiver = pc.addTransceiver(track, { direction: 'sendonly', sendEncodings })
       if (track.kind === 'video') this.videoSender = transceiver.sender
       if (track.kind === 'audio') this.audioSender = transceiver.sender
       return { track, transceiver }
     })
     if (this.videoSender) {
       const videoTransceiver = transceivers.find(({ track }) => track.kind === 'video')?.transceiver
-      if (videoTransceiver) await prioritizeVideo(videoTransceiver)
+      if (videoTransceiver) await prioritizeVideo(videoTransceiver, this.simulcastEnabled)
       await capVideo(this.videoSender, tracks.find(t => t.kind === 'video')!, this.quality)
     }
     const session = await relayCall('hostSession', { roomId: this.roomId })
@@ -120,7 +128,15 @@ export class RelayPublisher {
   async setQuality(quality: RelayQuality): Promise<void> {
     this.quality = quality
     const track = this.videoSender?.track
-    if (track && this.videoSender) await capVideo(this.videoSender, track, quality)
+    if (track && this.videoSender && !this.simulcastEnabled) await capVideo(this.videoSender, track, quality)
+  }
+  async setSimulcastEnabled(enabled: boolean): Promise<void> {
+    if (this.simulcastEnabled === enabled) return
+    this.simulcastEnabled = enabled
+    if (!this.lastStream || this.disposed) return
+    const stream = this.lastStream
+    this.streamTask = this.streamTask.catch(() => {}).then(async () => { await this.closeCurrent(); await this.updateStream(stream) })
+    await this.streamTask
   }
   async stats(): Promise<string> {
     if (!this.pc) return 'Waiting for video'
@@ -157,6 +173,7 @@ export class RelayReceiver {
   private pulling: Promise<void> | null = null
   private restarting: Promise<void> | null = null
   private stream = new MediaStream()
+  private quality: 'auto' | '1080p' | '720p' | '480p' = 'auto'
   constructor(private ticket: string, private onStream: (stream: MediaStream) => void, private onCap: () => void) {}
   pull(): Promise<void> {
     if (this.restarting) return this.restarting
@@ -181,6 +198,11 @@ export class RelayReceiver {
     await gathered(pc)
     await relayCall('viewerRenegotiate', { sessionId, sessionDescription: plainDescription(pc) }, this.ticket)
     this.pulled = true
+    if (this.quality !== 'auto') await relayCall('viewerQuality', { sessionId, quality: this.quality }, this.ticket)
+  }
+  async setQuality(quality: 'auto' | '1080p' | '720p' | '480p'): Promise<void> {
+    this.quality = quality
+    if (this.pulled && this.sessionId) await relayCall('viewerQuality', { sessionId: this.sessionId, quality }, this.ticket)
   }
   async heartbeat(): Promise<void> {
     if (!this.sessionId || !this.pulled) return

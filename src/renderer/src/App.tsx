@@ -31,7 +31,7 @@ import {
 } from '../../shared/host-session'
 import { generateRoomCode, formatRoomCode, isRoomCode } from '../../shared/room-code'
 import type { Message, Participant } from '../../shared/protocol'
-import type { PickedMedia, EmbeddedSubtitleTrack } from '../../shared/electron-api'
+import type { PickedMedia, EmbeddedSubtitleTrack, AudioTrackInfo } from '../../shared/electron-api'
 import { defaultSettings, type Settings } from '../../shared/settings'
 import { openPartyRoom, localPeerId, type PartyRoom, type RoomEvents } from '../net/signaling'
 import { effectiveQuality, estimatedUploadMbps, type Quality } from '../../shared/quality'
@@ -45,6 +45,7 @@ import { RelayPublisher, RelayReceiver, RelayError, relayCall } from '../net/rel
 import { UsageMeter } from './UsageMeter'
 
 type Mode = 'home' | 'host' | 'viewer'
+type PlayerView = 'normal' | 'cinema' | 'fullscreen'
 type ViewerStatus =
   'connecting' | 'pending' | 'waiting' | 'playing' | 'paused' | 'host-left' | 'room-full' | 'kicked' | 'denied' | 'locked' | 'banned' | 'monthly-cap' | 'failed'
 
@@ -82,15 +83,21 @@ function formatClock(value: number): string {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
 }
 
-function enterPlayerFullscreen(element: HTMLDivElement | null): void {
-  if (element) void element.requestFullscreen().then(() => window.partycast.setFullscreen(true)).catch(() => {})
-}
-
 export function App(): React.JSX.Element {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [draftSettings, setDraftSettings] = useState<Settings>(defaultSettings)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [mode, setMode] = useState<Mode>('home')
+  const [playerView, setPlayerView] = useState<PlayerView>('normal')
+  const [previousPlayerView, setPreviousPlayerView] = useState<PlayerView>('normal')
+  const [chatVisible, setChatVisible] = useState(true)
+  const [controlsVisible, setControlsVisible] = useState(true)
+  const [shortcutHelp, setShortcutHelp] = useState(false)
+  const [allowViewerPlaybackControl, setAllowViewerPlaybackControl] = useState(false)
+  const [viewerCanControl, setViewerCanControl] = useState(false)
+  const [viewerQuality, setViewerQuality] = useState<'auto' | '1080p' | '720p' | '480p'>('auto')
+  const [qualitySelectionEnabled, setQualitySelectionEnabled] = useState(false)
+  const [viewerQualityEnabled, setViewerQualityEnabled] = useState(true)
   const [joining, setJoining] = useState(false)
   const [codeInput, setCodeInput] = useState('')
   const [roomCode, setRoomCode] = useState('')
@@ -105,6 +112,7 @@ export function App(): React.JSX.Element {
   const [viewerVolume, setViewerVolume] = useState(1)
   const [hostVolume, setHostVolume] = useState(1)
   const [viewerPositionNow, setViewerPositionNow] = useState(0)
+  const [viewerSeeking, setViewerSeeking] = useState<number | null>(null)
   const [hostPositionNow, setHostPositionNow] = useState(0)
   const [error, setError] = useState('')
   const [chat, setChat] = useState<ChatLine[]>([])
@@ -115,6 +123,9 @@ export function App(): React.JSX.Element {
   const [subtitlesVisible, setSubtitlesVisible] = useState(true)
   const [subtitleSize, setSubtitleSize] = useState<'S' | 'M' | 'L'>('M')
   const [embeddedTracks, setEmbeddedTracks] = useState<EmbeddedSubtitleTrack[]>([])
+  const [audioTracks, setAudioTracks] = useState<AudioTrackInfo[]>([])
+  const [audioSelection, setAudioSelection] = useState<number | null>(null)
+  const [mediaProgress, setMediaProgress] = useState<number | null>(null)
   const [embeddedBusy, setEmbeddedBusy] = useState(false)
   const [subtitleSelection, setSubtitleSelection] = useState('off')
   const [subtitleNotice, setSubtitleNotice] = useState('')
@@ -126,6 +137,7 @@ export function App(): React.JSX.Element {
   const [transportChoice, setTransportChoice] = useState<'relay' | 'direct'>('direct')
   const [relayQuality, setRelayQuality] = useState<RelayQuality>('1080p')
   const [streamStats, setStreamStats] = useState('')
+  const [viewerSizes, setViewerSizes] = useState<Record<string, { width: number; height: number }>>({})
   const [relayUsage, setRelayUsage] = useState<RelayUsage | null>(null)
   const [usageFailed, setUsageFailed] = useState(false)
   const [toast, setToast] = useState('')
@@ -134,6 +146,7 @@ export function App(): React.JSX.Element {
   const sessionRef = useRef<HostSession>(createHostSession(8))
   const mediaRef = useRef<PickedMedia | null>(null)
   const captureRef = useRef<MediaStream | null>(null)
+  const staleCapturesRef = useRef<MediaStream[]>([])
   const hostVideoRef = useRef<HTMLVideoElement>(null)
   const viewerVideoRef = useRef<HTMLVideoElement>(null)
   const viewerFrameRef = useRef<HTMLDivElement>(null)
@@ -145,6 +158,11 @@ export function App(): React.JSX.Element {
   const publisherRef = useRef<RelayPublisher | null>(null)
   const receiverRef = useRef<RelayReceiver | null>(null)
   const lastRelayRevisionRef = useRef(0)
+  const controlRequestTimesRef = useRef(new Map<string, number[]>())
+  const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const allowViewerPlaybackControlRef = useRef(false)
+  const qualitySelectionEnabledRef = useRef(false)
+  const pendingMediaPositionRef = useRef<{ time: number; wasPlaying: boolean } | null>(null)
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ block: 'end' }) }, [chat])
   const addChat = (line: Omit<ChatLine, 'key'>): void => setChat(old => [...old.slice(-199), { ...line, key: Date.now() + Math.random() }])
@@ -156,6 +174,7 @@ export function App(): React.JSX.Element {
     void window.partycast.relayHasKey().then(value => { setHasRelayKey(value); if (value) setTransportChoice('relay') }).catch(() => {})
     void window.partycast.relayDefaultUrl().then(setRelayDefaultUrl).catch(() => {})
   }, [])
+  useEffect(() => window.partycast.onMediaProgress(setMediaProgress), [])
   useEffect(() => {
     if (viewerVideoRef.current) { viewerVideoRef.current.volume = viewerVolume; viewerVideoRef.current.muted = false }
   }, [viewerVolume, mode])
@@ -170,14 +189,67 @@ export function App(): React.JSX.Element {
     return () => clearInterval(timer)
   }, [mode, viewerState])
   useEffect(() => {
-    const exitFullscreen = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape' && document.fullscreenElement) void document.exitFullscreen()
+    if (viewerSeeking === null || !viewerState) return
+    if (Math.abs(viewerState.currentTime - viewerSeeking) < 1) setViewerSeeking(null)
+  }, [viewerState, viewerSeeking])
+  useEffect(() => { if (!viewerCanControl) setViewerSeeking(null) }, [viewerCanControl])
+  const enterView = (next: PlayerView, element: HTMLDivElement | null): void => {
+    if (mode === 'host' || mode === 'viewer') localStorage.setItem(`partycast-view-${mode}`, next)
+    if (next === 'fullscreen') {
+      setPreviousPlayerView(playerView === 'fullscreen' ? 'normal' : playerView)
+      setPlayerView('fullscreen')
+      if (element) void element.requestFullscreen().then(() => window.partycast.setFullscreen(true)).catch(() => setPlayerView('normal'))
+    } else {
+      if (document.fullscreenElement) void document.exitFullscreen()
+      setPlayerView(next)
     }
-    const fullscreenChange = (): void => { void window.partycast.setFullscreen(!!document.fullscreenElement) }
+  }
+  const exitViewFullscreen = (): void => {
+    if (document.fullscreenElement) void document.exitFullscreen()
+    setPlayerView(previousPlayerView)
+  }
+  useEffect(() => {
+    if (playerView !== 'fullscreen') { setControlsVisible(true); return }
+    const show = (): void => {
+      setControlsVisible(true)
+      if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current)
+      controlsTimerRef.current = setTimeout(() => setControlsVisible(false), 3000)
+    }
+    window.addEventListener('mousemove', show)
+    show()
+    return () => { window.removeEventListener('mousemove', show); if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current) }
+  }, [playerView])
+  useEffect(() => {
+    if (mode !== 'host' && mode !== 'viewer') return
+    const keydown = (event: KeyboardEvent): void => {
+      const target = event.target
+      if (target instanceof HTMLElement && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return
+      const video = mode === 'host' ? hostVideoRef.current : viewerVideoRef.current
+      const key = event.key.toLowerCase()
+      if (key === ' ' && (mode === 'host' || viewerCanControl)) { event.preventDefault(); if (mode === 'host') { if (video?.paused) void video.play(); else video?.pause() } else requestViewerControl(viewerState?.playing ? 'pause' : 'play') }
+      else if (key === 'f') { event.preventDefault(); enterView('fullscreen', mode === 'host' ? hostFrameRef.current : viewerFrameRef.current) }
+      else if (key === 'c') { event.preventDefault(); enterView('cinema', null) }
+      else if (key === 'm') { event.preventDefault(); if (mode === 'host') setHostVolume(value => value === 0 ? 1 : 0); else setViewerVolume(value => value === 0 ? 1 : 0) }
+      else if ((event.key === 'ArrowLeft' || event.key === 'ArrowRight') && (mode === 'host' || viewerCanControl)) { event.preventDefault(); const time = Math.max(0, Math.min(video?.duration ?? 0, (video?.currentTime ?? 0) + (event.key === 'ArrowLeft' ? -10 : 10))); if (mode === 'host' && video) video.currentTime = time; else requestViewerControl('seek', time) }
+      else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') { event.preventDefault(); const change = event.key === 'ArrowUp' ? 0.05 : -0.05; if (mode === 'host') setHostVolume(value => Math.max(0, Math.min(1, value + change))); else setViewerVolume(value => Math.max(0, Math.min(1, value + change))) }
+      else if (event.key === '?') setShortcutHelp(value => !value)
+    }
+    window.addEventListener('keydown', keydown)
+    return () => window.removeEventListener('keydown', keydown)
+  }, [mode, viewerCanControl, viewerState, playerView])
+  useEffect(() => {
+    const exitFullscreen = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape' && document.fullscreenElement) { void document.exitFullscreen(); setPlayerView(previousPlayerView) }
+    }
+    const fullscreenChange = (): void => {
+      const active = !!document.fullscreenElement
+      void window.partycast.setFullscreen(active)
+      if (!active) setPlayerView(value => value === 'fullscreen' ? previousPlayerView : value)
+    }
     window.addEventListener('keydown', exitFullscreen)
     document.addEventListener('fullscreenchange', fullscreenChange)
     return () => { window.removeEventListener('keydown', exitFullscreen); document.removeEventListener('fullscreenchange', fullscreenChange) }
-  }, [])
+  }, [previousPlayerView])
   useEffect(() => {
     if (mode !== 'host') return
     const update = (): void => setHostPositionNow(hostVideoRef.current?.currentTime ?? 0)
@@ -195,6 +267,7 @@ export function App(): React.JSX.Element {
         await publisherRef.current?.close().catch(() => {})
         if (relayRoomRef.current && mode === 'host') await relayCall('roomClose', { roomId: relayRoomRef.current.roomId }).catch(() => {})
         if (mode === 'host') await window.partycast.runHostHook('stop').catch(() => {})
+        if (mode === 'host') await window.partycast.releaseMedia().catch(() => false)
         await room?.leave().catch(() => {})
         window.partycast.closeReady()
       })()
@@ -204,6 +277,24 @@ export function App(): React.JSX.Element {
     if (mode !== 'viewer') return
     const timer = setInterval(() => { void roomRef.current?.stats().then(setStreamStats).catch(() => {}) }, 1000)
     return () => clearInterval(timer)
+  }, [mode])
+  useEffect(() => {
+    if (mode !== 'host') return
+    const update = (): void => {
+      const room = roomRef.current
+      if (!room) return
+      void Promise.all(sessionRef.current.viewers.map(async viewer => [viewer.peerId, await room.peerVideoSize(viewer.peerId)] as const)).then(entries => {
+        setViewerSizes(Object.fromEntries(entries.filter((entry): entry is readonly [string, { width: number; height: number }] => entry[1] !== null)))
+      }).catch(() => {})
+    }
+    update()
+    const timer = setInterval(update, 1500)
+    return () => clearInterval(timer)
+  }, [mode])
+  useEffect(() => {
+    if (mode !== 'host' && mode !== 'viewer') return
+    const saved = localStorage.getItem(`partycast-view-${mode}`)
+    if (saved === 'normal' || saved === 'cinema') setPlayerView(saved)
   }, [mode])
 
   const saveProfile = useCallback(
@@ -264,9 +355,11 @@ export function App(): React.JSX.Element {
       const hook = await window.partycast.runHostHook('stop').catch(() => ({ ok: false, ran: false, message: 'Stop hook failed' }))
       if (!hook.ok) setToast(hook.message ?? 'Stop hook failed')
     }
+    if (mode === 'host') await window.partycast.releaseMedia().catch(() => false)
     await room?.leave().catch(() => {})
     captureRef.current?.getTracks().forEach((track) => track.stop())
     captureRef.current = null
+    for (const stale of staleCapturesRef.current.splice(0)) stale.getTracks().forEach(track => track.stop())
     mediaRef.current = null
     setMedia(null)
     setConnectingPeers([])
@@ -293,6 +386,8 @@ export function App(): React.JSX.Element {
       return
     }
     const relayHost = transportChoice === 'relay' && hasRelayKey
+    qualitySelectionEnabledRef.current = !relayHost
+    setQualitySelectionEnabled(!relayHost)
     if (!relayHost && settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
     let code = generateRoomCode()
     let iceServers: RTCIceServer[] | undefined
@@ -324,7 +419,7 @@ export function App(): React.JSX.Element {
     setMedia(null)
     setChat([])
     mediaRef.current = null
-    if (relayRoomRef.current && iceServers) publisherRef.current = new RelayPublisher(relayRoomRef.current.roomId, iceServers, relayQuality)
+    if (relayRoomRef.current && iceServers) publisherRef.current = new RelayPublisher(relayRoomRef.current.roomId, iceServers, relayQuality, qualitySelectionEnabledRef.current)
     const events: RoomEvents = {
       canJoin: peerId => admission(sessionRef.current, peerId),
       onPeerConnecting: (peerId) => setConnectingPeers((old) => (old.includes(peerId) ? old : [...old.slice(-31), peerId])),
@@ -354,6 +449,18 @@ export function App(): React.JSX.Element {
           if (settings.autoAccept) void acceptViewer(peerId)
         } else if (message.type === 'chat' && sessionRef.current.viewers.some(p => p.peerId === peerId)) {
           deliverChat(peerId, message.text)
+        } else if (message.type === 'control-request' && allowViewerPlaybackControlRef.current && sessionRef.current.viewers.some(p => p.peerId === peerId)) {
+          const now = Date.now()
+          const recent = (controlRequestTimesRef.current.get(peerId) ?? []).filter(time => now - time < 1000)
+          if (recent.length >= 4) return
+          recent.push(now); controlRequestTimesRef.current.set(peerId, recent)
+          const video = hostVideoRef.current
+          if (!video || !mediaRef.current) return
+          if (message.action === 'seek' && message.currentTime !== undefined && message.currentTime <= video.duration) { video.currentTime = message.currentTime; systemLine(`${sessionRef.current.viewers.find(p => p.peerId === peerId)?.name ?? 'Viewer'} seeked to ${formatClock(message.currentTime)}`) }
+          else if (message.action === 'pause') { video.pause(); systemLine(`${sessionRef.current.viewers.find(p => p.peerId === peerId)?.name ?? 'Viewer'} paused playback`) }
+          else if (message.action === 'play') { void video.play(); systemLine(`${sessionRef.current.viewers.find(p => p.peerId === peerId)?.name ?? 'Viewer'} resumed playback`) }
+        } else if (message.type === 'quality' && sessionRef.current.viewers.some(p => p.peerId === peerId)) {
+          void roomRef.current?.setViewerQuality(peerId, message.quality)
         }
       },
       onAbuse: peerId => { void kick(peerId) },
@@ -390,6 +497,7 @@ export function App(): React.JSX.Element {
       if (settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
     }
     setViewerRelay(!!pinnedHostId)
+    setViewerQualityEnabled(!pinnedHostId)
     lastRelayRevisionRef.current = 0
     const name = settings.displayName.trim()
     setRoomCode(code)
@@ -446,6 +554,8 @@ export function App(): React.JSX.Element {
         else if (message.type === 'chat-delivery') addChat({ senderId: message.senderId, text: message.text, time: message.time })
         else if (message.type === 'system') addChat({ senderId: '', text: message.text, time: message.time, system: true })
         else if (message.type === 'subtitle') setSubtitleText(message.text)
+        else if (message.type === 'controls-enabled') setViewerCanControl(message.enabled)
+        else if (message.type === 'quality-enabled') setViewerQualityEnabled(message.enabled)
       },
       onStream: (stream) => {
         if (pinnedHostId) return
@@ -483,10 +593,32 @@ export function App(): React.JSX.Element {
     captureRef.current = null
     mediaRef.current = selected
     setMedia(selected)
+    setAudioTracks(selected.audioTracks)
+    setAudioSelection(selected.selectedAudioStream)
+    setMediaProgress(null)
     loadSubtitle(selected.subtitle)
     void refreshEmbeddedTracks(selected)
     setError('')
     sendState()
+  }
+
+  const selectAudioTrack = async (streamIndex: number): Promise<void> => {
+    const video = hostVideoRef.current
+    if (!video || !mediaRef.current) return
+    pendingMediaPositionRef.current = { time: video.currentTime, wasPlaying: !video.paused }
+    setMediaProgress(0)
+    const selected = await window.partycast.selectAudioTrack(streamIndex)
+    if (!selected) { setMediaProgress(null); setError('Could not prepare this audio track.'); return }
+    if (captureRef.current) staleCapturesRef.current.push(captureRef.current)
+    captureRef.current = null
+    mediaRef.current = selected
+    setMedia(selected)
+    setAudioSelection(selected.selectedAudioStream)
+    setMediaProgress(null)
+  }
+  const requestViewerControl = (action: 'play' | 'pause' | 'seek', currentTime?: number): void => {
+    if (!viewerCanControl) return
+    void roomRef.current?.send({ version: 1, type: 'control-request', action, ...(currentTime === undefined ? {} : { currentTime }) }).catch(() => {})
   }
 
   const loadSubtitle = (file: { title: string; text: string } | null): void => {
@@ -599,8 +731,12 @@ export function App(): React.JSX.Element {
         else void roomRef.current?.setHostStream(stream).catch(() => {})
       })
     }
-    if (publisherRef.current) void publisherRef.current.setStream(captureRef.current).catch(() => setError('Could not publish to Cloudflare relay.'))
-    else void roomRef.current?.setHostStream(captureRef.current).catch(() => {})
+    const publication = publisherRef.current
+      ? publisherRef.current.setStream(captureRef.current)
+      : roomRef.current?.setHostStream(captureRef.current) ?? Promise.resolve()
+    void publication.then(() => {
+      for (const stale of staleCapturesRef.current.splice(0)) stale.getTracks().forEach(track => track.stop())
+    }).catch(() => setError('Could not publish the selected video track.'))
     sendState()
   }
 
@@ -635,6 +771,8 @@ export function App(): React.JSX.Element {
     void roomRef.current?.send({ version: 1, type: 'hello', name: settings?.displayName ?? 'Host', role: 'host' }, peerId).catch(() => {})
     sendRoster(settings?.displayName ?? 'Host')
     sendState(peerId)
+    void roomRef.current?.send({ version: 1, type: 'controls-enabled', enabled: allowViewerPlaybackControlRef.current }, peerId).catch(() => {})
+    void roomRef.current?.send({ version: 1, type: 'quality-enabled', enabled: qualitySelectionEnabledRef.current }, peerId).catch(() => {})
     void roomRef.current?.send({ version: 1, type: 'subtitle', text: lastCueRef.current }, peerId).catch(() => {})
     systemLine(`${pending.name} joined`)
   }
@@ -759,7 +897,7 @@ export function App(): React.JSX.Element {
   )
   const subtitleOverlay = subtitlesVisible && subtitleText && <div className={`subtitle-overlay subtitle-${subtitleSize.toLowerCase()}`} dir="auto">{subtitleText}</div>
   return (
-    <div className="app-shell">
+    <div className={`app-shell view-${playerView} ${playerView === 'fullscreen' && !controlsVisible ? 'controls-hidden' : ''}`} data-view-mode={playerView}>
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">
@@ -896,7 +1034,7 @@ export function App(): React.JSX.Element {
             <div
               ref={hostFrameRef}
               className={`player-frame host-frame ${media ? 'has-media' : ''}`}
-              onDoubleClick={() => enterPlayerFullscreen(hostFrameRef.current)}
+              onDoubleClick={() => enterView('fullscreen', hostFrameRef.current)}
               onDragOver={(event) => event.preventDefault()}
               onDrop={(event) => {
                 event.preventDefault()
@@ -913,7 +1051,18 @@ export function App(): React.JSX.Element {
                   crossOrigin="anonymous"
                   autoPlay
                   playsInline
+                  onLoadedMetadata={event => {
+                    const pending = pendingMediaPositionRef.current
+                    if (pending) event.currentTarget.currentTime = Math.min(pending.time, event.currentTarget.duration || pending.time)
+                  }}
                   onLoadedData={syncCapture}
+                  onCanPlay={event => {
+                    const pending = pendingMediaPositionRef.current
+                    if (!pending) return
+                    pendingMediaPositionRef.current = null
+                    if (pending.wasPlaying) void event.currentTarget.play()
+                    else event.currentTarget.pause()
+                  }}
                   onPlay={syncCapture}
                   onPause={() => sendState()}
                   onSeeked={() => sendState()}
@@ -944,16 +1093,23 @@ export function App(): React.JSX.Element {
                 </div>
               )}
               {subtitleOverlay}
+              {mediaProgress !== null && <div className="media-preparing" role="status"><span>Preparing audio… {Math.round(mediaProgress)}%</span><progress max="100" value={mediaProgress} /><button className="button-subtle" onClick={() => { void window.partycast.cancelMediaPreparation(); setMediaProgress(null) }}>Cancel</button></div>}
+              {playerView === 'fullscreen' && <button className="button-subtle fullscreen-exit" onClick={exitViewFullscreen}>Exit fullscreen</button>}
               {media && <div className="player-controls host-player-controls">
                 <input aria-label="Host timeline" type="range" min="0" max={hostVideoRef.current?.duration || 0} step="0.1" value={Math.min(hostPositionNow, hostVideoRef.current?.duration || 0)} onChange={event => { const video = hostVideoRef.current; if (video) { video.currentTime = Number(event.target.value); setHostPositionNow(video.currentTime); sendState() } }} />
               <div className="player-control-row"><span>{formatClock(hostPositionNow)} / {formatClock(hostVideoRef.current?.duration ?? 0)}</span><div className="player-control-actions">
                   <button className="icon-button" aria-label={hostVideoRef.current?.paused ? 'Play playback' : 'Pause playback'} title={hostVideoRef.current?.paused ? 'Play playback' : 'Pause playback'} onClick={() => { const video = hostVideoRef.current; if (video?.paused) void video.play(); else video?.pause() }}>{hostVideoRef.current?.paused ? <Play size={18} /> : <Pause size={18} />}</button>
                   <button className="icon-button" aria-label={hostVolume === 0 ? 'Unmute host' : 'Mute host'} title={hostVolume === 0 ? 'Unmute host' : 'Mute host'} onClick={() => setHostVolume(value => value === 0 ? 1 : 0)}>{hostVolume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}</button>
+                  <button className="icon-button shortcut-help-toggle" aria-label="Keyboard shortcuts" onClick={() => setShortcutHelp(value => !value)}>?</button>
                   <input aria-label="Host volume" type="range" min="0" max="1" step="0.01" value={hostVolume} onChange={event => setHostVolume(Number(event.target.value))} />
-                  <button className="icon-button" aria-label="Fullscreen" title="Fullscreen" onClick={() => enterPlayerFullscreen(hostFrameRef.current)}><Expand size={19} /></button>
+                  <button className="icon-button" aria-label="Fullscreen" title="Fullscreen" onClick={() => enterView('fullscreen', hostFrameRef.current)}><Expand size={19} /></button>
+                  <button className="button-subtle" onClick={() => setChatVisible(value => !value)}>{chatVisible ? 'Hide chat' : 'Show chat'}</button>
                 </div></div>
               </div>}
+              {playerView === 'fullscreen' && chatVisible && <div className="fullscreen-chat">{chatPanel}</div>}
+              {shortcutHelp && <div className="shortcut-help"><strong>Keyboard shortcuts</strong><span>Space · Play / pause</span><span>F · Fullscreen</span><span>C · Cinema</span><span>M · Mute</span><span>← / → · Seek 10 seconds</span><span>↑ / ↓ · Volume</span></div>}
             </div>
+            {media && <div className="view-mode-switch" aria-label="View mode">{(['normal', 'cinema', 'fullscreen'] as const).map(view => <button key={view} className={playerView === view ? 'active' : ''} onClick={() => enterView(view, hostFrameRef.current)}>{view === 'normal' ? 'Normal' : view === 'cinema' ? 'Cinema' : 'Fullscreen'}</button>)}</div>}
             <div className="player-footer">
               <div className="media-title">
                 <span className="media-icon">
@@ -968,6 +1124,9 @@ export function App(): React.JSX.Element {
               </div>
               {media && (
                 <div className="subtitle-controls">
+                  {audioTracks.length > 1 && <><label htmlFor="host-audio-track">Audio</label><select id="host-audio-track" aria-label="Audio track" value={audioSelection ?? ''} disabled={mediaProgress !== null} onChange={event => { void selectAudioTrack(Number(event.target.value)) }}>
+                    {audioTracks.map(track => <option key={track.streamIndex} value={track.streamIndex}>{[track.language.toUpperCase(), track.codec.toUpperCase(), track.channels ? `${track.channels} ch` : '', track.title].filter(Boolean).join(' · ')}{track.isDefault ? ' · Default' : ''}</option>)}
+                  </select></>}
                   <label htmlFor="host-subtitle-track">Subtitles</label>
                   <select
                     id="host-subtitle-track"
@@ -1037,8 +1196,9 @@ export function App(): React.JSX.Element {
             </section>
             <section className="sidebar-block">
               <div className="sidebar-label">STREAM QUALITY</div>
-              {relayRoomRef.current ? <><select aria-label="Relay quality" value={relayQuality} onChange={event => setRelayQuality(event.target.value as RelayQuality)}><option value="1080p">1080p · 4.5 Mbps</option><option value="1080p-high">1080p High · 6 Mbps</option><option value="720p">720p · 2.5 Mbps</option></select><p className="bandwidth-note">One upload: {(RELAY_BITRATES[relayQuality] / 1_000_000).toFixed(1)} Mbps, regardless of viewer count.</p>{hasRelayKey && (relayUsage ? <UsageMeter usage={relayUsage} compact /> : usageFailed && <p className="usage-unavailable">Usage unavailable</p>)}</> : <><select aria-label="Stream quality" value={quality} onChange={event => applyQuality(event.target.value as Quality)}>{Object.entries(qualityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><p className="bandwidth-note">Using ~{estimatedUploadMbps(actualQuality, session.viewers.length).toFixed(1)} Mbps of your {settings?.uploadMbps ?? 6} Mbps upload ({actualQuality}).</p></>}
+              {relayRoomRef.current ? <><select aria-label="Relay quality" value={relayQuality} onChange={event => setRelayQuality(event.target.value as RelayQuality)}><option value="1080p">1080p · 4.5 Mbps</option><option value="1080p-high">1080p High · 6 Mbps</option><option value="720p">720p · 2.5 Mbps</option></select><p className="bandwidth-note">One upload: {(RELAY_BITRATES[relayQuality] / 1_000_000).toFixed(1)} Mbps, regardless of viewer count.</p><label className="toggle-line"><input aria-label="Let friends choose quality" type="checkbox" checked={qualitySelectionEnabled} onChange={event => { const enabled = event.target.checked; qualitySelectionEnabledRef.current = enabled; setQualitySelectionEnabled(enabled); void publisherRef.current?.setSimulcastEnabled(enabled).catch(() => setError('Could not update relay quality layers.')); void roomRef.current?.send({ version: 1, type: 'quality-enabled', enabled }).catch(() => {}) }} /> Let friends choose quality</label><p className="bandwidth-note">Adds about 2 Mbps of upload for 720p and 480p choices.</p>{hasRelayKey && (relayUsage ? <UsageMeter usage={relayUsage} compact /> : usageFailed && <p className="usage-unavailable">Usage unavailable</p>)}</> : <><select aria-label="Stream quality" value={quality} onChange={event => applyQuality(event.target.value as Quality)}>{Object.entries(qualityLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><p className="bandwidth-note">Using ~{estimatedUploadMbps(actualQuality, session.viewers.length).toFixed(1)} Mbps of your {settings?.uploadMbps ?? 6} Mbps upload ({actualQuality}).</p></>}
               <p className="stream-stats">{streamStats}</p>
+              <label className="toggle-line"><input aria-label="Let friends control playback" type="checkbox" checked={allowViewerPlaybackControl} onChange={event => { const enabled = event.target.checked; allowViewerPlaybackControlRef.current = enabled; setAllowViewerPlaybackControl(enabled); void roomRef.current?.send({ version: 1, type: 'controls-enabled', enabled }).catch(() => {}) }} /> Let friends control playback</label>
             </section>
             <section className="sidebar-block participants-block">
               <div className="participant-heading">
@@ -1063,7 +1223,7 @@ export function App(): React.JSX.Element {
                     <span className="avatar">{viewer.name.charAt(0).toUpperCase()}</span>
                     <span className="participant-main">
                       <strong dir="auto">{viewer.name}</strong>
-                      <small>{viewer.connection === 'connected' ? 'Connected' : viewer.connection}</small>
+                      <small>{viewer.connection === 'connected' ? 'Connected' : viewer.connection}{viewerSizes[viewer.peerId] ? ` · ${viewerSizes[viewer.peerId].width}×${viewerSizes[viewer.peerId].height}` : ''}</small>
                     </span>
                     <button
                       className="kick-button"
@@ -1128,10 +1288,13 @@ export function App(): React.JSX.Element {
               autoPlay
               playsInline
               onDoubleClick={() => {
-                enterPlayerFullscreen(viewerFrameRef.current)
+                enterView('fullscreen', viewerFrameRef.current)
               }}
             />
+            {playerView === 'fullscreen' && <button className="button-subtle fullscreen-exit" onClick={exitViewFullscreen}>Exit fullscreen</button>}
             {subtitleOverlay}
+            {playerView === 'fullscreen' && chatVisible && <div className="fullscreen-chat">{chatPanel}</div>}
+            {shortcutHelp && <div className="shortcut-help"><strong>Keyboard shortcuts</strong><span>Space · Play / pause</span><span>F · Fullscreen</span><span>C · Cinema</span><span>M · Mute</span><span>← / → · Seek 10 seconds</span><span>↑ / ↓ · Volume</span></div>}
             {(viewerStatus === 'connecting' || viewerStatus === 'pending' ||
               viewerStatus === 'waiting' ||
               terminalStatuses.includes(viewerStatus)) && (
@@ -1160,11 +1323,14 @@ export function App(): React.JSX.Element {
               </div>
             )}
             {viewerState?.title && <div className="player-controls viewer-player-controls">
-              <input aria-label="Viewer timeline" type="range" min="0" max={viewerState.duration} step="0.1" value={Math.min(viewerPositionNow, viewerState.duration)} disabled aria-readonly="true" />
+              <input aria-label="Viewer timeline" type="range" min="0" max={viewerState.duration} step="0.1" value={Math.min(viewerSeeking ?? viewerPositionNow, viewerState.duration)} disabled={!viewerCanControl} onChange={event => { const time = Number(event.target.value); setViewerSeeking(time); requestViewerControl('seek', time) }} />
               <div className="player-control-row"><span>{formatClock(viewerPositionNow)} / {formatClock(viewerState.duration)}</span><div className="player-control-actions">
+                {viewerCanControl && <button className="icon-button" aria-label={viewerState.playing ? 'Pause playback' : 'Play playback'} onClick={() => requestViewerControl(viewerState.playing ? 'pause' : 'play')}>{viewerState.playing ? <Pause size={18} /> : <Play size={18} />}</button>}
                 <button className="icon-button" aria-label={viewerVolume === 0 ? 'Unmute viewer' : 'Mute viewer'} title={viewerVolume === 0 ? 'Unmute viewer' : 'Mute viewer'} onClick={() => setViewerVolume(value => value === 0 ? 1 : 0)}>{viewerVolume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}</button>
+                <button className="icon-button shortcut-help-toggle" aria-label="Keyboard shortcuts" onClick={() => setShortcutHelp(value => !value)}>?</button>
                 <input aria-label="Volume" type="range" min="0" max="1" step="0.01" value={viewerVolume} onChange={event => setViewerVolume(Number(event.target.value))} />
-                <button className="icon-button" aria-label="Fullscreen" title="Fullscreen" onClick={() => enterPlayerFullscreen(viewerFrameRef.current)}><Expand size={19} /></button>
+                <button className="icon-button" aria-label="Fullscreen" title="Fullscreen" onClick={() => enterView('fullscreen', viewerFrameRef.current)}><Expand size={19} /></button>
+                <button className="button-subtle" onClick={() => setChatVisible(value => !value)}>{chatVisible ? 'Hide chat' : 'Show chat'}</button>
               </div></div>
             </div>}
           </div>
@@ -1175,6 +1341,9 @@ export function App(): React.JSX.Element {
               {viewerState?.title ? ` · ${viewerState.title}` : ''}
             </div>
             <div className="viewer-control-actions">
+              <button className="button-subtle" onClick={() => { const video = viewerVideoRef.current; if (video && viewerState) { video.playbackRate = 1; video.currentTime = viewerPosition(viewerState, Date.now()); void video.play().catch(() => {}) } }}>Resync</button>
+              <span className="drift-indicator" aria-live="polite">{viewerVideoRef.current && Math.abs(viewerVideoRef.current.currentTime - viewerPositionNow) > 2 ? 'LIVE · drifting' : 'LIVE'}</span>
+              <label className="quality-picker">Quality <select aria-label="Viewer quality" value={viewerQuality} disabled={viewerRelay && !viewerQualityEnabled} title={viewerRelay && !viewerQualityEnabled ? 'Auto (host quality)' : undefined} onChange={event => { const next = event.target.value as typeof viewerQuality; setViewerQuality(next); if (viewerRelay) void receiverRef.current?.setQuality(next).catch(() => setError('Could not change relay quality.')); else void roomRef.current?.send({ version: 1, type: 'quality', quality: next }).catch(() => {}) }}><option value="auto">{viewerRelay && !viewerQualityEnabled ? 'Auto (host quality)' : 'Auto'}</option>{(!viewerRelay || viewerQualityEnabled) && <><option value="1080p">1080p</option><option value="720p">720p</option><option value="480p">480p</option></>}</select></label>
               {error && (
                 <button
                   className="button-subtle"
@@ -1195,7 +1364,8 @@ export function App(): React.JSX.Element {
             {roster.length ? roster.map((person) => <span key={person.peerId} dir="auto">{person.name}{person.peerId === 'host' && <span className="host-pill">HOST</span>} · </span>) : 'Waiting for participants'}
           </div>
           <p className="stream-stats" aria-label="Stream stats">{streamStats}</p>
-          <div className="viewer-extras"><div className="subtitle-controls"><button className="button-subtle" onClick={() => setSubtitlesVisible(v => !v)}>{subtitlesVisible ? 'Subtitles on' : 'Subtitles off'}</button><select aria-label="Subtitle size" value={subtitleSize} onChange={event => setSubtitleSize(event.target.value as 'S' | 'M' | 'L')}><option>S</option><option>M</option><option>L</option></select></div>{chatPanel}</div>
+          <div className="view-mode-switch viewer-mode-switch" aria-label="View mode">{(['normal', 'cinema', 'fullscreen'] as const).map(view => <button key={view} className={playerView === view ? 'active' : ''} onClick={() => enterView(view, viewerFrameRef.current)}>{view === 'normal' ? 'Normal' : view === 'cinema' ? 'Cinema' : 'Fullscreen'}</button>)}</div>
+          <div className="viewer-extras"><div className="subtitle-controls"><button className="button-subtle" onClick={() => setSubtitlesVisible(v => !v)}>{subtitlesVisible ? 'Subtitles on' : 'Subtitles off'}</button><select aria-label="Subtitle size" value={subtitleSize} onChange={event => setSubtitleSize(event.target.value as 'S' | 'M' | 'L')}><option>S</option><option>M</option><option>L</option></select></div>{chatVisible && chatPanel}</div>
         </main>
       )}
 

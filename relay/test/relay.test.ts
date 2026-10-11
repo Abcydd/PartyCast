@@ -203,6 +203,24 @@ describe('relay Worker authorization and routes', () => {
     expect((await request('/v1/sfu/viewer/session', 'POST', {}, ticket)).status).toBe(401)
   })
 
+  it('viewer can select only a permitted simulcast layer for its own subscription', async () => {
+    const room = await createRoom('simulcastviewer')
+    const hostSession = await host('/v1/sfu/host/session', 'POST', { roomId: room.roomId })
+    const { sessionId: hostSessionId } = await hostSession.json() as { sessionId: string }
+    await host('/v1/sfu/host/tracks', 'POST', { roomId: room.roomId, sessionId: hostSessionId, sessionDescription: { type: 'offer', sdp: 'v=0' }, tracks: [{ location: 'local', mid: '0', trackName: 'video' }] })
+    const ticketResponse = await host(`/v1/rooms/${room.roomId}/tickets`, 'POST', { viewerId: 'qualityviewer' })
+    const { ticket } = await ticketResponse.json() as { ticket: string }
+    const sessionResponse = await request('/v1/sfu/viewer/session', 'POST', {}, ticket)
+    const { sessionId } = await sessionResponse.json() as { sessionId: string }
+    await request('/v1/sfu/viewer/pull', 'POST', { sessionId }, ticket)
+    expect(getSfuCalls().at(-1)).toMatchObject({ path: `/sessions/${sessionId}/tracks/new`, payload: { tracks: [{ trackName: 'video', simulcast: { preferredRid: 'f', ridNotAvailable: 'asciibetical' } }] } })
+    clearSfuCalls()
+    const changed = await request('/v1/sfu/viewer/quality', 'PUT', { sessionId, quality: '720p' }, ticket)
+    expect(changed.status).toBe(200)
+    expect(getSfuCalls().at(-1)).toMatchObject({ method: 'PUT', path: `/sessions/${sessionId}/tracks/update`, payload: { tracks: [{ mid: '0', simulcast: { preferredRid: 'h' } }] } })
+    expect((await request('/v1/sfu/viewer/quality', 'PUT', { sessionId, quality: '2160p' }, ticket)).status).toBe(400)
+  })
+
   it('inactive viewer gets its tracks closed (assert the mocked SFU close call)', async () => {
     const room = await createRoom('timeoutroom')
     const hs = await host('/v1/sfu/host/session', 'POST', { roomId: room.roomId })

@@ -30,7 +30,9 @@ export type PartyRoom = {
   send(message: Message, peerId?: string): Promise<void>
   setHostStream(stream: MediaStream | null): Promise<void>
   setQuality(quality: EffectiveQuality): Promise<void>
+  setViewerQuality(peerId: string, quality: 'auto' | '1080p' | '720p' | '480p'): Promise<void>
   stats(): Promise<string>
+  peerVideoSize(peerId: string): Promise<{ width: number; height: number } | null>
   approvePeer(peerId: string): Promise<void>
   rejectPeer(peerId: string): void
   leave(): Promise<void>
@@ -59,6 +61,7 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
   let mediaTask: Promise<void> = Promise.resolve()
   let closed = false
   let lastBytes = 0, lastTimestamp = 0
+  const viewerQualities = new Map<string, 'auto' | '1080p' | '720p' | '480p'>()
   const remoteStream = new MediaStream()
   const codecNegotiationReady = new WeakSet<RTCPeerConnection>()
 
@@ -146,7 +149,11 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
         if (sender.track?.kind !== 'video') continue
         const parameters = sender.getParameters()
         if (!parameters.encodings?.length) parameters.encodings = [{}]
-        parameters.encodings[0].maxBitrate = BITRATES[currentQuality]
+        const viewerQuality = viewerQualities.get(id)
+        const bitrate = viewerQuality === '480p' ? 600_000 : viewerQuality === '720p' ? 1_500_000 : viewerQuality === '1080p' ? 4_500_000 : BITRATES[currentQuality]
+        parameters.encodings[0].maxBitrate = bitrate
+        if (viewerQuality && viewerQuality !== 'auto') parameters.encodings[0].scaleResolutionDownBy = viewerQuality === '720p' ? 1.5 : viewerQuality === '480p' ? 2.25 : 1
+        parameters.degradationPreference = 'maintain-resolution'
         try { await sender.setParameters(parameters) } catch { /* Encoder does not support the cap. */ }
       }
     }
@@ -201,6 +208,7 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
     },
     setHostStream(stream) { mediaTask = mediaTask.catch(() => {}).then(() => updateStream(stream)); return mediaTask },
     async setQuality(next) { currentQuality = next; await applyBitrate() },
+    async setViewerQuality(peerId, next) { if (role !== 'host' || !approved.has(peerId)) return; viewerQualities.set(peerId, next); await applyBitrate(peerId) },
     async stats() {
       const connection = role === 'host'
         ? Object.entries(room.getPeers()).find(([id]) => approved.has(id))?.[1]
@@ -216,10 +224,26 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
           if (role === 'host' && lastTimestamp && report.timestamp > lastTimestamp) bitrate = (report.bytesSent - lastBytes) * 8 / (report.timestamp - lastTimestamp) / 1000
           if (role === 'host') { lastBytes = report.bytesSent; lastTimestamp = report.timestamp }
         }
-        if (role === 'viewer' && report.type === 'inbound-rtp' && report.kind === 'audio') audioEnergy = report.totalAudioEnergy ?? audioEnergy
+        if (role === 'viewer' && report.type === 'inbound-rtp' && report.kind === 'audio') audioEnergy += report.totalAudioEnergy ?? 0
       })
       const audio = role === 'viewer' ? ` · audio energy ${audioEnergy}` : ''
       return `${codec} · ${width || '?'}×${height || '?'} · ${bitrate.toFixed(2)} Mbps (${(BITRATES[currentQuality] / 1_000_000).toFixed(1)} cap)${audio}`
+    },
+    async peerVideoSize(peerId) {
+      if (role !== 'host' || !approved.has(peerId)) return null
+      const connection = room.getPeers()[peerId]
+      if (!connection) return null
+      const sender = connection.getSenders().find(item => item.track?.kind === 'video')
+      if (!sender) return null
+      const reports = await sender.getStats()
+      let size: { width: number; height: number } | null = null
+      reports.forEach(report => {
+        if (report.type !== 'outbound-rtp' || report.kind !== 'video' || typeof report.frameHeight !== 'number') return
+        const height = report.frameHeight
+        const width = typeof report.frameWidth === 'number' ? report.frameWidth : height === 720 ? 1280 : height === 480 ? 854 : 1920
+        size = { width, height }
+      })
+      return size
     },
     async approvePeer(peerId) { if (role !== 'host' || !connected.has(peerId) || blocked.has(peerId)) return; approved.add(peerId); if (!network.relayControl) { await mediaTask; await attach(peerId) } },
     rejectPeer(peerId) { block(peerId); approved.delete(peerId); connected.delete(peerId); room.getPeers()[peerId]?.close() },

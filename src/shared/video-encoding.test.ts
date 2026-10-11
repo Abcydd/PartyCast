@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { codecPreferenceOrder } from './video-encoding'
+import { codecPreferenceOrder, simulcastCodecOrder } from './video-encoding'
 
 const codecs = ['video/VP9', 'video/rtx', 'video/H264', 'video/AV1', 'video/H265', 'video/red', 'video/ulpfec'].map(mimeType => ({ mimeType }))
 const names = (items: typeof codecs): string[] => items.map(codec => codec.mimeType)
@@ -19,5 +19,12 @@ describe('sender codec ranking', () => {
   })
   it('uses H264 first if encoding information is unavailable', () => {
     expect(names(codecPreferenceOrder(codecs)).slice(0, 4)).toEqual(['video/H264', 'video/VP9', 'video/AV1', 'video/H265'])
+  })
+})
+
+describe('simulcastCodecOrder', () => {
+  it('puts H264 then VP8 first and keeps repair codecs last', () => {
+    const codecs = [{ mimeType: 'video/AV1' }, { mimeType: 'video/rtx' }, { mimeType: 'video/H265' }, { mimeType: 'video/VP9' }, { mimeType: 'video/VP8' }, { mimeType: 'video/H264' }]
+    expect(simulcastCodecOrder(codecs).map(c => c.mimeType)).toEqual(['video/H264', 'video/VP8', 'video/VP9', 'video/AV1', 'video/H265', 'video/rtx'])
   })
 })

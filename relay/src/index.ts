@@ -13,7 +13,7 @@ export interface Env {
   CODE_RATE_LIMITER?: RateLimit
 }
 
-type Viewer = { sessionId?: string; lastSessionId?: string; mids: string[]; last: number; active: boolean }
+type Viewer = { sessionId?: string; lastSessionId?: string; mids: string[]; videoMids?: string[]; last: number; active: boolean }
 type Room = { id: string; code: string; hostPeerId: string; expires: number; bitrateMbps: number; hostSessionId?: string; hostTracks: { mid: string; trackName: string }[]; viewers: Record<string, Viewer>; revoked: string[] }
 type Data = { rooms: Record<string, Room>; month: string; estGB: number }
 const alphabet = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
@@ -124,7 +124,7 @@ export class RelayState {
           viewer.active = false
           viewer.lastSessionId = viewer.sessionId
           viewer.sessionId = undefined
-          viewer.mids = []
+          viewer.mids = []; viewer.videoMids = []
         }
         delete data.rooms[room.id]
         continue
@@ -141,7 +141,7 @@ export class RelayState {
           }
           viewer.lastSessionId = viewer.sessionId
           viewer.sessionId = undefined
-          viewer.mids = []
+          viewer.mids = []; viewer.videoMids = []
         }
       }
     }
@@ -156,7 +156,7 @@ export class RelayState {
             }
             viewer.lastSessionId = viewer.sessionId
             viewer.sessionId = undefined
-            viewer.mids = []
+            viewer.mids = []; viewer.videoMids = []
           }
         }
       }
@@ -344,7 +344,7 @@ export class RelayState {
             result = json({ closed: true })
           } else result = error('not-found', 404)
         }
-      } else if (method === 'POST' && /^\/v1\/sfu\/viewer\/(session|pull|renegotiate|close|heartbeat)$/.test(path)) {
+      } else if ((method === 'POST' && /^\/v1\/sfu\/viewer\/(session|pull|renegotiate|close|heartbeat)$/.test(path)) || (method === 'PUT' && path === '/v1/sfu/viewer/quality')) {
         const { room, record } = await viewer()
         const b = await body(request), action = path.split('/').at(-1)
         if (action === 'session') {
@@ -353,6 +353,10 @@ export class RelayState {
           const created = await this.sfu('POST', '/sessions/new')
           if (!id(created.sessionId)) throw new HttpError('sfu-error', 502)
           record.sessionId = created.sessionId; result = json(created)
+        } else if (action === 'quality') {
+          if (!exact(b, ['sessionId','quality']) || record.sessionId !== b.sessionId || !['auto','1080p','720p','480p'].includes(String(b.quality)) || !record.videoMids?.length || !room.hostSessionId) throw new HttpError('invalid-body', 400)
+          const preferredRid = b.quality === '720p' ? 'h' : b.quality === '480p' ? 'q' : 'f'
+          result = json(await this.sfu('PUT', `/sessions/${record.sessionId}/tracks/update`, { tracks: record.videoMids.map(mid => ({ location: 'remote', sessionId: room.hostSessionId, trackName: 'video', mid, simulcast: { preferredRid, priorityOrdering: 'asciibetical', ridNotAvailable: 'asciibetical' } })) }))
         } else {
           const sessionMatches =
             record.sessionId === b.sessionId ||
@@ -362,9 +366,12 @@ export class RelayState {
             if (!exact(b, ['sessionId'])) throw new HttpError('invalid-body', 400)
             if (data.estGB >= this.cap()) throw new HttpError('monthly-cap', 429)
             if (!room.hostSessionId || !room.hostTracks.length) throw new HttpError('no-host-tracks', 409)
-            const tracks = room.hostTracks.map(t => ({ location: 'remote', sessionId: room.hostSessionId, trackName: t.trackName }))
+            // Video is pulled with simulcast fallback so a viewer can later pick a layer; harmless when the host publishes one layer.
+            const tracks = room.hostTracks.map(t => ({ location: 'remote', sessionId: room.hostSessionId, trackName: t.trackName, ...(t.trackName === 'video' ? { simulcast: { preferredRid: 'f', priorityOrdering: 'asciibetical', ridNotAvailable: 'asciibetical' } } : {}) }))
             const response = await this.sfu('POST', `/sessions/${record.sessionId}/tracks/new`, { tracks })
-            record.mids = Array.isArray(response.tracks) ? response.tracks.filter(obj).map(t => t.mid).filter(mid) : []
+            const pulled = Array.isArray(response.tracks) ? response.tracks.filter(obj) : []
+            record.mids = pulled.map(t => t.mid).filter(mid)
+            record.videoMids = pulled.filter((t, i) => (t.trackName ?? tracks[i]?.trackName) === 'video').map(t => t.mid).filter(mid)
             record.active = true; record.last = getNow()
             result = json(response)
           } else if (action === 'renegotiate') {

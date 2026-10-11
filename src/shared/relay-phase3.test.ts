@@ -43,6 +43,8 @@ describe('relay configuration and identity', () => {
     expect(relayEndpoint({ operation: 'lookup', payload: { code: 'ABC-234' } })?.path).toBe('/v1/rooms/by-code/ABC234')
     expect(relayEndpoint({ operation: 'hostClose', payload: { roomId: '12345678-1234-1234-1234-123456789abc', sessionId: 'viewer-session' } })?.host).toBe(true)
     expect(relayEndpoint({ operation: 'viewerPull', payload: { sessionId: 'a', tracks: [] }, ticket: 'payload.signature' })).toBeNull()
+    expect(relayEndpoint({ operation: 'viewerQuality', payload: { sessionId: 'viewer-session', quality: '720p' }, ticket: 'payload.signature' })).toMatchObject({ path: '/v1/sfu/viewer/quality', method: 'PUT', host: false })
+    expect(relayEndpoint({ operation: 'viewerQuality', payload: { sessionId: 'viewer-session', quality: '2160p' }, ticket: 'payload.signature' })).toBeNull()
     expect(relayEndpoint({ operation: 'hostTracks', payload: { roomId: '12345678-1234-1234-1234-123456789abc', sessionId: 'host', tracks: [{ location: 'local', mid: '0', trackName: 'video' }], sessionDescription: { type: 'offer', sdp: 'x'.repeat(32769) } } })).toBeNull()
   })
 })

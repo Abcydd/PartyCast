@@ -153,7 +153,7 @@ async function measureOutboundStats(hostPage, preset) {
   }
 
   const sample1 = await hostPage.evaluate(async () => {
-    for (const entry of window.__pcList || []) {
+    for (const entry of window.__pcList || []) { if (entry.pc.signalingState === 'closed') continue;
       const reports = await entry.pc.getStats()
       for (const r of reports.values()) {
         if (r.type === 'outbound-rtp' && r.kind === 'video') {
@@ -174,7 +174,7 @@ async function measureOutboundStats(hostPage, preset) {
   await sleep(10000)
 
   const sample2 = await hostPage.evaluate(async () => {
-    for (const entry of window.__pcList || []) {
+    for (const entry of window.__pcList || []) { if (entry.pc.signalingState === 'closed') continue;
       const reports = await entry.pc.getStats()
       for (const r of reports.values()) {
         if (r.type === 'outbound-rtp' && r.kind === 'video') {
@@ -388,7 +388,7 @@ async function runE2eTest() {
     }
 
     const inboundStats = await viewerPage.evaluate(async () => {
-      for (const entry of window.__pcList || []) {
+      for (const entry of window.__pcList || []) { if (entry.pc.signalingState === 'closed') continue;
         const reports = await entry.pc.getStats()
         for (const r of reports.values()) {
           if (r.type === 'inbound-rtp' && r.kind === 'video') {
@@ -406,7 +406,7 @@ async function runE2eTest() {
 
     const audioEnergy = () => viewerPage.evaluate(async () => {
       let energy = 0
-      for (const entry of window.__pcList || []) {
+      for (const entry of window.__pcList || []) { if (entry.pc.signalingState === 'closed') continue;
         const reports = await entry.pc.getStats()
         for (const r of reports.values()) if (r.type === 'inbound-rtp' && r.kind === 'audio') energy += r.totalAudioEnergy || 0
       }
@@ -419,7 +419,56 @@ async function runE2eTest() {
       throw new Error(`Viewer inbound audio energy did not rise through the relay: ${energyStart} -> ${energyEnd}`)
     }
 
+    // Simulcast: host enables friend quality choice, viewer picks 720p, inbound height must drop.
+    const inboundHeight = () => viewerPage.evaluate(async () => {
+      for (const entry of window.__pcList || []) { if (entry.pc.signalingState === 'closed') continue;
+        const reports = await entry.pc.getStats()
+        for (const r of reports.values()) if (r.type === 'inbound-rtp' && r.kind === 'video' && r.frameHeight) return r.frameHeight
+      }
+      return 0
+    })
+    await hostPage.getByLabel('Let friends choose quality').check()
+    await sleep(6000)
+    const heightBefore = await inboundHeight()
+    await viewerPage.getByLabel('Viewer quality').selectOption('720p')
+    let heightAfter = 0
+    for (let i = 0; i < 30 && !(heightAfter > 0 && heightAfter <= 720); i++) { await sleep(500); heightAfter = await inboundHeight() }
+    const simulcastErrors = await viewerPage.evaluate(() => document.body.innerText.match(/Could not change relay quality|Could not update relay quality layers/g) ?? [])
+    if (!(heightAfter > 0 && heightAfter <= 720) || simulcastErrors.length) {
+      const hostLayers = await hostPage.evaluate(async () => {
+        const out = []
+        for (const entry of window.__pcList || []) {
+          if (entry.pc.signalingState === 'closed') continue
+          const reports = await entry.pc.getStats()
+          for (const r of reports.values()) if (r.type === 'outbound-rtp' && r.kind === 'video') out.push({ rid: r.rid, h: r.frameHeight, codec: reports.get(r.codecId)?.mimeType, bytes: r.bytesSent, active: r.active, limit: r.qualityLimitationReason })
+          const sdp = entry.pc.localDescription?.sdp ?? ''
+          out.push({ simulcastLine: sdp.split(String.fromCharCode(10)).find(line => line.startsWith('a=simulcast:'))?.trim() ?? '' })
+        }
+        return out
+      })
+      throw new Error(`Relay simulcast 720p not applied: before=${heightBefore} after=${heightAfter} errors=${simulcastErrors.join(',')} host=${JSON.stringify(hostLayers)}`)
+    }
+    await viewerPage.getByLabel('Viewer quality').selectOption('1080p')
+    let heightBack = 0
+    const backTrace = []
+    for (let i = 0; i < 60 && heightBack < 1080; i++) { await sleep(500); heightBack = await inboundHeight(); backTrace.push(heightBack) }
+    const hostLayersAfter = await hostPage.evaluate(async () => {
+      const out = []
+      for (const entry of window.__pcList || []) {
+        if (entry.pc.signalingState === 'closed') continue
+        const reports = await entry.pc.getStats()
+        for (const r of reports.values()) if (r.type === 'outbound-rtp' && r.kind === 'video') out.push({ rid: r.rid, h: r.frameHeight, fps: r.framesPerSecond, codec: reports.get(r.codecId)?.mimeType, kbps: r.targetBitrate, limit: r.qualityLimitationReason })
+      }
+      return out
+    })
+    if (heightBack < 1080) throw new Error(`Relay simulcast did not return to 1080p: trace=${JSON.stringify(backTrace)}`)
+    console.log('simulcast back-to-1080 trace', JSON.stringify(backTrace), JSON.stringify(hostLayersAfter))
+    // Back to a single layer so the preset measurements below see one encoding.
+    await hostPage.getByLabel('Let friends choose quality').uncheck()
+    await sleep(8000)
+
     results.steps.step3_host_approves_playback = {
+      simulcastHeights: { before: heightBefore, at720: heightAfter, backTo1080: heightBack },
       inboundAudioEnergy: [energyStart, energyEnd],
       passed: true,
       timeToMediaMs: Date.now() - approveStartTime,
@@ -455,7 +504,7 @@ async function runE2eTest() {
     // -------------------------------------------------------------
     const hostPrivacyData = await hostPage.evaluate(async () => {
       const connections = []
-      for (const entry of window.__pcList || []) {
+      for (const entry of window.__pcList || []) { if (entry.pc.signalingState === 'closed') continue;
         const stats = await entry.pc.getStats()
         const localCandidates = []
         let selectedPair = null
@@ -523,7 +572,7 @@ async function runE2eTest() {
     }
 
     const viewerPrivacyData = await viewerPage.evaluate(async () => {
-      const pcs = window.__pcList || []
+      const pcs = (window.__pcList || []).filter(entry => entry.pc.signalingState !== 'closed')
       const controlEntry = pcs.find(entry => {
         const urls = entry.config.iceServers?.flatMap(s => Array.isArray(s.urls) ? s.urls : [s.urls]) || []
         return urls.some(u => u && u.includes('google.com')) || !urls.some(u => u && u.includes('cloudflare.com'))

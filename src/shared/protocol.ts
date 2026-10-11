@@ -14,12 +14,16 @@ export type Message =
   | { version: 1; type: 'chat-delivery'; senderId: string; text: string; time: number }
   | { version: 1; type: 'subtitle'; text: string | null }
   | { version: 1; type: 'system'; text: string; time: number }
+  | { version: 1; type: 'controls-enabled'; enabled: boolean }
+  | { version: 1; type: 'control-request'; action: 'play' | 'pause' | 'seek'; currentTime?: number }
+  | { version: 1; type: 'quality'; quality: 'auto' | '1080p' | '720p' | '480p' }
+  | { version: 1; type: 'quality-enabled'; enabled: boolean }
 
 const record = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v)
 const peerId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= 128
 const time = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0
 const bounded = (v: unknown, max: number): v is string => typeof v === 'string' && v.length > 0 && v.length <= max
-export const isViewerAllowedMessage = (m: Message): boolean => m.type === 'hello' && m.role === 'viewer' || m.type === 'chat'
+export const isViewerAllowedMessage = (m: Message): boolean => m.type === 'hello' && m.role === 'viewer' || m.type === 'chat' || m.type === 'control-request' || m.type === 'quality'
 export const isHostAllowedMessage = (m: Message): boolean => !isViewerAllowedMessage(m)
 
 export function decodeMessage(raw: unknown): Message | null {
@@ -39,6 +43,10 @@ export function decodeMessage(raw: unknown): Message | null {
     case 'chat-delivery': return peerId(v.senderId) && bounded(v.text, 500) && time(v.time) ? { version: 1, type: 'chat-delivery', senderId: v.senderId, text: sanitizeChat(v.text), time: v.time } : null
     case 'subtitle': return v.text === null || typeof v.text === 'string' && v.text.length <= 500 ? { version: 1, type: 'subtitle', text: v.text === null ? null : sanitizeSubtitleText(v.text as string) } : null
     case 'system': return bounded(v.text, 500) && time(v.time) ? { version: 1, type: 'system', text: sanitizeText(v.text, 500), time: v.time } : null
+    case 'controls-enabled': return typeof v.enabled === 'boolean' ? { version: 1, type: 'controls-enabled', enabled: v.enabled } : null
+    case 'quality-enabled': return typeof v.enabled === 'boolean' ? { version: 1, type: 'quality-enabled', enabled: v.enabled } : null
+    case 'control-request': return (v.action === 'play' || v.action === 'pause' || v.action === 'seek') && (v.action !== 'seek' ? v.currentTime === undefined : time(v.currentTime)) ? { version: 1, type: 'control-request', action: v.action, ...(v.currentTime === undefined ? {} : { currentTime: v.currentTime as number }) } : null
+    case 'quality': return ['auto', '1080p', '720p', '480p'].includes(String(v.quality)) ? { version: 1, type: 'quality', quality: v.quality as Extract<Message,{type:'quality'}>['quality'] } : null
     default: return null
   }
 }

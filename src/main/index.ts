@@ -17,6 +17,7 @@ import { parseRangeHeader } from './range'
 import type { PickedMedia, EmbeddedSubtitleTrack } from '../shared/electron-api'
 import { effectiveRelayUrl, type HookConfig } from '../shared/relay-config'
 import { allowAppPermission } from './permissions'
+import { cancelAudioPreparation, cleanTemporaryMedia, prepareAudio, probeAudio, removeTemporaryMedia } from './media-audio'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -26,6 +27,7 @@ protocol.registerSchemesAsPrivileged([
 ])
 
 const mediaFiles = new Map<string, string>()
+let originalMediaPath: string | null = null
 const contentTypes: Record<string, string> = {
   '.mp4': 'video/mp4',
   '.m4v': 'video/mp4',
@@ -35,13 +37,18 @@ const contentTypes: Record<string, string> = {
   '.avi': 'video/x-msvideo',
 }
 
-async function registerMedia(path: string): Promise<PickedMedia> {
+async function registerMedia(path: string, selectedAudioStream?: number, progress?: (value: number | null) => void): Promise<PickedMedia> {
+  const probed = await probeAudio(path).catch(() => ({ tracks: [], duration: 0 }))
+  const audio = probed.tracks.find(track => track.streamIndex === selectedAudioStream) ?? probed.tracks.find(track => track.isDefault) ?? probed.tracks[0]
+  const playablePath = audio ? await prepareAudio(path, audio.streamIndex, probed.duration, progress ?? (() => {})) : path
+  for (const previous of mediaFiles.values()) if (previous !== path) await removeTemporaryMedia(previous)
   const token = randomUUID()
   mediaFiles.clear()
-  mediaFiles.set(token, path)
+  mediaFiles.set(token, playablePath)
+  originalMediaPath = path
   const stem = parse(path).name
   const subtitle = await readSubtitle(join(dirname(path), `${stem}.srt`)) ?? await readSubtitle(join(dirname(path), `${stem}.vtt`))
-  return { url: `partycast-media://video/${token}`, title: basename(path), subtitle }
+  return { url: `partycast-media://video/${token}`, title: basename(path), subtitle, audioTracks: probed.tracks, selectedAudioStream: audio?.streamIndex ?? null }
 }
 
 function settingsPath(): string {
@@ -50,8 +57,7 @@ function settingsPath(): string {
 
 // The single host-picked video; the renderer can never name a path itself.
 function currentMediaPath(): string | null {
-  const path = mediaFiles.values().next().value
-  return path ?? null
+  return originalMediaPath
 }
 
 const appContents = new WeakSet<Electron.WebContents>()
@@ -112,6 +118,7 @@ app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler((contents, permission, callback) => callback(allowAppPermission(ownPermissionContents(contents), permission)))
   session.defaultSession.setPermissionCheckHandler((contents, permission) => allowAppPermission(ownPermissionContents(contents), permission))
   protocol.handle('partycast-media', async (request) => {
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS', 'Access-Control-Allow-Headers': 'Range, Content-Type' } })
     const token = new URL(request.url).pathname.slice(1)
     const path = mediaFiles.get(token)
     if (!path) return new Response('Not found', { status: 404 })
@@ -123,6 +130,9 @@ app.whenReady().then(() => {
         'Accept-Ranges': 'bytes',
         'Content-Type': contentTypes[extname(path).toLowerCase()] ?? 'application/octet-stream',
         'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+        'Access-Control-Allow-Headers': 'Range, Content-Type',
       })
       if (range === 'unsatisfiable') {
         headers.set('Content-Range', `bytes */${info.size}`)
@@ -211,7 +221,24 @@ app.whenReady().then(() => {
       properties: ['openFile'],
       filters: [{ name: 'Video files', extensions: ['mp4', 'm4v', 'webm', 'mov', 'mkv', 'avi'] }],
     })
-    return result.canceled || !result.filePaths[0] ? null : registerMedia(result.filePaths[0])
+    if (result.canceled || !result.filePaths[0]) return null
+    const window = BrowserWindow.fromWebContents(event.sender)
+    try { return await registerMedia(result.filePaths[0], undefined, value => window?.webContents.send('media:progress', value)) }
+    catch { return null }
+  })
+  ipcMain.handle('media:select-audio', async (event, streamIndex: unknown) => {
+    if (!trusted(event) || !Number.isSafeInteger(streamIndex) || !originalMediaPath) return null
+    const window = BrowserWindow.fromWebContents(event.sender)
+    try { return await registerMedia(originalMediaPath, streamIndex as number, value => window?.webContents.send('media:progress', value)) }
+    catch { return null }
+  })
+  ipcMain.handle('media:cancel-preparation', event => trusted(event) && cancelAudioPreparation())
+  ipcMain.handle('media:release', async event => {
+    if (!trusted(event)) return false
+    for (const path of mediaFiles.values()) await removeTemporaryMedia(path)
+    mediaFiles.clear()
+    originalMediaPath = null
+    return true
   })
   ipcMain.handle('media:drop', async (event, input: unknown) => {
     if (!trusted(event)) return null
@@ -223,7 +250,7 @@ app.whenReady().then(() => {
     } catch {
       return null
     }
-    return registerMedia(path)
+    try { return await registerMedia(path) } catch { return null }
   })
   ipcMain.handle('subtitle:pick', async (event) => {
     if (!trusted(event)) return null
@@ -315,6 +342,8 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
+
+app.on('before-quit', () => { void cleanTemporaryMedia() })
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()

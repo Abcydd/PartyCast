@@ -6,6 +6,14 @@ const api: PartyCastApi = {
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
   configureHook: (config) => ipcRenderer.invoke('hook:configure', config),
   pickMedia: () => ipcRenderer.invoke('media:pick'),
+  selectAudioTrack: streamIndex => ipcRenderer.invoke('media:select-audio', streamIndex),
+  cancelMediaPreparation: () => ipcRenderer.invoke('media:cancel-preparation'),
+  releaseMedia: () => ipcRenderer.invoke('media:release'),
+  onMediaProgress: callback => {
+    const listener = (_event: Electron.IpcRendererEvent, progress: number | null): void => callback(progress)
+    ipcRenderer.on('media:progress', listener)
+    return () => ipcRenderer.removeListener('media:progress', listener)
+  },
   registerDroppedFile: (file) => {
     const path = webUtils.getPathForFile(file)
     return path ? ipcRenderer.invoke('media:drop', path) : Promise.resolve(null)
