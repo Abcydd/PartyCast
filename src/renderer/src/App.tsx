@@ -7,12 +7,14 @@ import {
   Expand,
   FolderOpen,
   LogOut,
+  Pause,
   Play,
   Plus,
   Radio,
   Settings2,
   Users,
   Volume2,
+  VolumeX,
   X,
 } from 'lucide-react'
 import {
@@ -32,8 +34,8 @@ import type { PickedMedia, EmbeddedSubtitleTrack } from '../../shared/electron-a
 import { defaultSettings, type Settings } from '../../shared/settings'
 import { openPartyRoom, localPeerId, type PartyRoom, type RoomEvents } from '../net/signaling'
 import { effectiveQuality, estimatedUploadMbps, type Quality } from '../../shared/quality'
-import { REACTIONS, type Reaction } from '../../shared/reactions'
 import { sanitizeChat } from '../../shared/text'
+import { viewerPosition } from '../../shared/viewer-position'
 import { cueAtTime, parseSubtitles, type Cue } from '../../shared/subtitles'
 import { trackLabel } from '../../shared/embedded-subtitles'
 import { RELAY_BITRATES, type RelayQuality, validRelayUrl } from '../../shared/relay-config'
@@ -70,10 +72,17 @@ const viewerMessages: Record<ViewerStatus, string> = {
 const terminalStatuses: ViewerStatus[] = ['host-left', 'room-full', 'kicked', 'denied', 'locked', 'banned', 'failed']
 
 type ChatLine = { key: number; text: string; senderId: string; time: number; system?: boolean }
-type FloatingReaction = { key: number; emoji: Reaction }
-
 function safeTime(value: number): number {
   return Number.isFinite(value) && value >= 0 ? value : 0
+}
+
+function formatClock(value: number): string {
+  const seconds = Math.floor(safeTime(value))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
+
+function enterPlayerFullscreen(element: HTMLDivElement | null): void {
+  if (element) void element.requestFullscreen().then(() => window.partycast.setFullscreen(true)).catch(() => {})
 }
 
 export function App(): React.JSX.Element {
@@ -93,10 +102,12 @@ export function App(): React.JSX.Element {
   const [viewerState, setViewerState] = useState<Extract<Message, { type: 'state' }> | null>(null)
   const [roster, setRoster] = useState<Participant[]>([])
   const [viewerVolume, setViewerVolume] = useState(1)
+  const [hostVolume, setHostVolume] = useState(1)
+  const [viewerPositionNow, setViewerPositionNow] = useState(0)
+  const [hostPositionNow, setHostPositionNow] = useState(0)
   const [error, setError] = useState('')
   const [chat, setChat] = useState<ChatLine[]>([])
   const [chatDraft, setChatDraft] = useState('')
-  const [floating, setFloating] = useState<FloatingReaction[]>([])
   const [subtitleCues, setSubtitleCues] = useState<Cue[]>([])
   const [subtitleOffset, setSubtitleOffset] = useState(0)
   const [subtitleText, setSubtitleText] = useState<string | null>(null)
@@ -125,6 +136,7 @@ export function App(): React.JSX.Element {
   const hostVideoRef = useRef<HTMLVideoElement>(null)
   const viewerVideoRef = useRef<HTMLVideoElement>(null)
   const viewerFrameRef = useRef<HTMLDivElement>(null)
+  const hostFrameRef = useRef<HTMLDivElement>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
   const lastCueRef = useRef<string | null>(null)
@@ -135,12 +147,6 @@ export function App(): React.JSX.Element {
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ block: 'end' }) }, [chat])
   const addChat = (line: Omit<ChatLine, 'key'>): void => setChat(old => [...old.slice(-199), { ...line, key: Date.now() + Math.random() }])
-  const addReaction = (emoji: Reaction): void => {
-    const key = Date.now() + Math.random()
-    setFloating(old => [...old, { key, emoji }])
-    setTimeout(() => setFloating(old => old.filter(item => item.key !== key)), 2800)
-  }
-
   useEffect(() => {
     void window.partycast
       .loadSettings()
@@ -150,8 +156,34 @@ export function App(): React.JSX.Element {
     void window.partycast.relayDefaultUrl().then(setRelayDefaultUrl).catch(() => {})
   }, [])
   useEffect(() => {
-    if (viewerVideoRef.current) viewerVideoRef.current.volume = viewerVolume
+    if (viewerVideoRef.current) { viewerVideoRef.current.volume = viewerVolume; viewerVideoRef.current.muted = false }
   }, [viewerVolume, mode])
+  useEffect(() => {
+    if (hostVideoRef.current) { hostVideoRef.current.volume = hostVolume; hostVideoRef.current.muted = false }
+  }, [hostVolume, mode, media])
+  useEffect(() => {
+    if (mode !== 'viewer' || !viewerState) return
+    const update = (): void => setViewerPositionNow(viewerPosition(viewerState, Date.now()))
+    update()
+    const timer = setInterval(update, 200)
+    return () => clearInterval(timer)
+  }, [mode, viewerState])
+  useEffect(() => {
+    const exitFullscreen = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape' && document.fullscreenElement) void document.exitFullscreen()
+    }
+    const fullscreenChange = (): void => { void window.partycast.setFullscreen(!!document.fullscreenElement) }
+    window.addEventListener('keydown', exitFullscreen)
+    document.addEventListener('fullscreenchange', fullscreenChange)
+    return () => { window.removeEventListener('keydown', exitFullscreen); document.removeEventListener('fullscreenchange', fullscreenChange) }
+  }, [])
+  useEffect(() => {
+    if (mode !== 'host') return
+    const update = (): void => setHostPositionNow(hostVideoRef.current?.currentTime ?? 0)
+    update()
+    const timer = setInterval(update, 200)
+    return () => clearInterval(timer)
+  }, [mode, media])
   useEffect(() => {
     return window.partycast.onWindowClosing(() => {
       const room = roomRef.current
@@ -166,6 +198,11 @@ export function App(): React.JSX.Element {
         window.partycast.closeReady()
       })()
     })
+  }, [mode])
+  useEffect(() => {
+    if (mode !== 'viewer') return
+    const timer = setInterval(() => { void roomRef.current?.stats().then(setStreamStats).catch(() => {}) }, 1000)
+    return () => clearInterval(timer)
   }, [mode])
 
   const saveProfile = useCallback(
@@ -185,6 +222,7 @@ export function App(): React.JSX.Element {
       playing: !!video && !video.paused && !!mediaRef.current,
       currentTime: safeTime(video?.currentTime ?? 0),
       duration: safeTime(video?.duration ?? 0),
+      sentAt: Date.now(),
       title: mediaRef.current?.title ?? null,
       ...(relayRoomRef.current ? { relayRevision: publisherRef.current?.generation ?? 0 } : {}),
     }
@@ -236,7 +274,6 @@ export function App(): React.JSX.Element {
     setJoining(false)
     setError('')
     setChat([])
-    setFloating([])
     setSubtitleCues([])
     setSubtitleText(null)
     setEmbeddedTracks([])
@@ -316,11 +353,9 @@ export function App(): React.JSX.Element {
           if (settings.autoAccept) void acceptViewer(peerId)
         } else if (message.type === 'chat' && sessionRef.current.viewers.some(p => p.peerId === peerId)) {
           deliverChat(peerId, message.text)
-        } else if (message.type === 'reaction' && sessionRef.current.viewers.some(p => p.peerId === peerId)) {
-          deliverReaction(peerId, message.emoji)
         }
       },
-      onAbuse: peerId => { void kick(peerId, true) },
+      onAbuse: peerId => { void kick(peerId) },
     }
     try {
       roomRef.current = openPartyRoom('host', code, settings, events, quality, relayHost ? { iceServers, relayControl: !qaControlDirect } : {})
@@ -350,7 +385,7 @@ export function App(): React.JSX.Element {
       if (lookup.mode !== 'relay' || typeof lookup.hostPeerId !== 'string' || typeof lookup.roomId !== 'string') throw new Error('Invalid relay room')
       pinnedHostId = lookup.hostPeerId
     } catch (cause) {
-      if (!(cause instanceof RelayError && cause.status === 404)) { setError('Could not check the relay room. Try again when the relay is reachable.'); return }
+      if (!(cause instanceof RelayError && cause.status === 404) && settings.relayOnly) { setError('Could not check the relay room. Try again when the relay is reachable.'); return }
       if (settings.relayOnly && !settings.turn.url) { setError('Relay-only needs a TURN server. Add one in Settings or turn off IP privacy.'); return }
     }
     setViewerRelay(!!pinnedHostId)
@@ -382,7 +417,7 @@ export function App(): React.JSX.Element {
           setViewerStatus(message.accepted ? 'waiting' : 'denied')
           if (message.relay) receiverRef.current = new RelayReceiver(message.relay.ticket, stream => {
             const video = viewerVideoRef.current
-            if (video) { video.srcObject = stream; void video.play().catch(() => setError('Press play to start the stream.')) }
+            if (video) { video.volume = viewerVolume; video.muted = false; video.srcObject = stream; void video.play().catch(() => setError('Press play to start the stream.')) }
           }, () => setViewerStatus('monthly-cap'))
         } else if (message.type === 'hello' && message.role === 'host') setHostName(message.name)
         else if (message.type === 'state') {
@@ -409,13 +444,14 @@ export function App(): React.JSX.Element {
         else if (message.type === 'room-closed') setViewerStatus('host-left')
         else if (message.type === 'chat-delivery') addChat({ senderId: message.senderId, text: message.text, time: message.time })
         else if (message.type === 'system') addChat({ senderId: '', text: message.text, time: message.time, system: true })
-        else if (message.type === 'reaction-display') addReaction(message.emoji)
         else if (message.type === 'subtitle') setSubtitleText(message.text)
       },
       onStream: (stream) => {
         if (pinnedHostId) return
         const video = viewerVideoRef.current
         if (video && video.srcObject !== stream) {
+          video.volume = viewerVolume
+          video.muted = false
           video.srcObject = stream
           void video.play().catch(() => setError('Press play to start the stream.'))
         }
@@ -539,6 +575,8 @@ export function App(): React.JSX.Element {
   const syncCapture = (): void => {
     const video = hostVideoRef.current
     if (!video || !mediaRef.current) return
+    video.muted = false
+    video.volume = hostVolume
     if (
       !captureRef.current ||
       captureRef.current.getTracks().every((track) => track.readyState === 'ended')
@@ -565,10 +603,10 @@ export function App(): React.JSX.Element {
     sendState()
   }
 
-  const systemLine = (text: string): void => {
+  const systemLine = (text: string, broadcast = true): void => {
     const time = Date.now()
     addChat({ senderId: '', text, time, system: true })
-    void roomRef.current?.send({ version: 1, type: 'system', text, time }).catch(() => {})
+    if (broadcast) void roomRef.current?.send({ version: 1, type: 'system', text, time }).catch(() => {})
   }
   const acceptViewer = async (peerId: string): Promise<void> => {
     const pending = sessionRef.current.pending.find(p => p.peerId === peerId)
@@ -608,7 +646,7 @@ export function App(): React.JSX.Element {
     sessionRef.current = removeViewer(sessionRef.current, peerId, ban)
     setSession(sessionRef.current)
     sendRoster(settings?.displayName || 'Host')
-    if (person) systemLine(`${person.name} was ${pending ? 'denied' : ban ? 'banned' : 'kicked'}`)
+    if (person) systemLine(`${person.name} was ${pending ? 'denied' : ban ? 'banned' : 'kicked'}`, !ban)
     setKickTarget(null)
   }
 
@@ -618,20 +656,12 @@ export function App(): React.JSX.Element {
     addChat({ senderId, text, time })
     void roomRef.current?.send(message).catch(() => {})
   }
-  const deliverReaction = (senderId: string, emoji: Reaction): void => {
-    addReaction(emoji)
-    void roomRef.current?.send({ version: 1, type: 'reaction-display', senderId, emoji }).catch(() => {})
-  }
   const submitChat = (): void => {
     const text = sanitizeChat(chatDraft)
     if (!text || mode === 'viewer' && (viewerStatus === 'pending' || terminalStatuses.includes(viewerStatus))) return
     setChatDraft('')
     if (mode === 'host') deliverChat('host', text)
     else void roomRef.current?.send({ version: 1, type: 'chat', text }).catch(() => {})
-  }
-  const react = (emoji: Reaction): void => {
-    if (mode === 'host') deliverReaction('host', emoji)
-    else if (viewerStatus !== 'pending' && !terminalStatuses.includes(viewerStatus)) void roomRef.current?.send({ version: 1, type: 'reaction', emoji }).catch(() => {})
   }
 
   const applyQuality = (next: Quality): void => {
@@ -724,10 +754,8 @@ export function App(): React.JSX.Element {
         <input aria-label="Chat message" placeholder="Say something…" value={chatDraft} maxLength={500} onChange={event => setChatDraft(event.target.value)} disabled={mode === 'viewer' && (viewerStatus === 'pending' || terminalStatuses.includes(viewerStatus))} />
         <button type="submit" className="button-subtle">Send</button>
       </form>
-      <div className="reaction-bar">{REACTIONS.map(emoji => <button key={emoji} type="button" title={`React ${emoji}`} onClick={() => react(emoji)} disabled={mode === 'viewer' && (viewerStatus === 'pending' || terminalStatuses.includes(viewerStatus))}>{emoji}</button>)}</div>
     </section>
   )
-  const reactionOverlay = <div className="reaction-overlay" aria-hidden="true">{floating.map(item => <span className="floating-reaction" key={item.key}>{item.emoji}</span>)}</div>
   const subtitleOverlay = subtitlesVisible && subtitleText && <div className={`subtitle-overlay subtitle-${subtitleSize.toLowerCase()}`} dir="auto">{subtitleText}</div>
   return (
     <div className="app-shell">
@@ -865,7 +893,9 @@ export function App(): React.JSX.Element {
               </button>
             </div>
             <div
+              ref={hostFrameRef}
               className={`player-frame host-frame ${media ? 'has-media' : ''}`}
+              onDoubleClick={() => enterPlayerFullscreen(hostFrameRef.current)}
               onDragOver={(event) => event.preventDefault()}
               onDrop={(event) => {
                 event.preventDefault()
@@ -881,7 +911,6 @@ export function App(): React.JSX.Element {
                   src={media.url}
                   crossOrigin="anonymous"
                   autoPlay
-                  controls
                   playsInline
                   onLoadedData={syncCapture}
                   onPlay={syncCapture}
@@ -913,8 +942,16 @@ export function App(): React.JSX.Element {
                   <span>MP4, WEBM, MOV, MKV, AVI · CODEC SUPPORT VARIES</span>
                 </div>
               )}
-              {reactionOverlay}
               {subtitleOverlay}
+              {media && <div className="player-controls host-player-controls">
+                <input aria-label="Host timeline" type="range" min="0" max={hostVideoRef.current?.duration || 0} step="0.1" value={Math.min(hostPositionNow, hostVideoRef.current?.duration || 0)} onChange={event => { const video = hostVideoRef.current; if (video) { video.currentTime = Number(event.target.value); setHostPositionNow(video.currentTime); sendState() } }} />
+              <div className="player-control-row"><span>{formatClock(hostPositionNow)} / {formatClock(hostVideoRef.current?.duration ?? 0)}</span><div className="player-control-actions">
+                  <button className="icon-button" aria-label={hostVideoRef.current?.paused ? 'Play playback' : 'Pause playback'} title={hostVideoRef.current?.paused ? 'Play playback' : 'Pause playback'} onClick={() => { const video = hostVideoRef.current; if (video?.paused) void video.play(); else video?.pause() }}>{hostVideoRef.current?.paused ? <Play size={18} /> : <Pause size={18} />}</button>
+                  <button className="icon-button" aria-label={hostVolume === 0 ? 'Unmute host' : 'Mute host'} title={hostVolume === 0 ? 'Unmute host' : 'Mute host'} onClick={() => setHostVolume(value => value === 0 ? 1 : 0)}>{hostVolume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}</button>
+                  <input aria-label="Host volume" type="range" min="0" max="1" step="0.01" value={hostVolume} onChange={event => setHostVolume(Number(event.target.value))} />
+                  <button className="icon-button" aria-label="Fullscreen" title="Fullscreen" onClick={() => enterPlayerFullscreen(hostFrameRef.current)}><Expand size={19} /></button>
+                </div></div>
+              </div>}
             </div>
             <div className="player-footer">
               <div className="media-title">
@@ -1090,10 +1127,9 @@ export function App(): React.JSX.Element {
               autoPlay
               playsInline
               onDoubleClick={() => {
-                void viewerFrameRef.current?.requestFullscreen()
+                enterPlayerFullscreen(viewerFrameRef.current)
               }}
             />
-            {reactionOverlay}
             {subtitleOverlay}
             {(viewerStatus === 'connecting' || viewerStatus === 'pending' ||
               viewerStatus === 'waiting' ||
@@ -1122,6 +1158,14 @@ export function App(): React.JSX.Element {
                 )}
               </div>
             )}
+            {viewerState?.title && <div className="player-controls viewer-player-controls">
+              <input aria-label="Viewer timeline" type="range" min="0" max={viewerState.duration} step="0.1" value={Math.min(viewerPositionNow, viewerState.duration)} disabled aria-readonly="true" />
+              <div className="player-control-row"><span>{formatClock(viewerPositionNow)} / {formatClock(viewerState.duration)}</span><div className="player-control-actions">
+                <button className="icon-button" aria-label={viewerVolume === 0 ? 'Unmute viewer' : 'Mute viewer'} title={viewerVolume === 0 ? 'Unmute viewer' : 'Mute viewer'} onClick={() => setViewerVolume(value => value === 0 ? 1 : 0)}>{viewerVolume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}</button>
+                <input aria-label="Volume" type="range" min="0" max="1" step="0.01" value={viewerVolume} onChange={event => setViewerVolume(Number(event.target.value))} />
+                <button className="icon-button" aria-label="Fullscreen" title="Fullscreen" onClick={() => enterPlayerFullscreen(viewerFrameRef.current)}><Expand size={19} /></button>
+              </div></div>
+            </div>}
           </div>
           <div className="viewer-controls">
             <div className="viewer-state">
@@ -1143,37 +1187,18 @@ export function App(): React.JSX.Element {
                   Play stream
                 </button>
               )}
-              <Volume2 size={18} />
-              <input
-                aria-label="Volume"
-                type="range"
-                min="0"
-                max="1"
-                step="0.01"
-                value={viewerVolume}
-                onChange={(event) => setViewerVolume(Number(event.target.value))}
-              />
-              <button
-                className="icon-button"
-                aria-label="Fullscreen"
-                title="Fullscreen"
-                onClick={() => {
-                  void viewerFrameRef.current?.requestFullscreen()
-                }}
-              >
-                <Expand size={19} />
-              </button>
             </div>
           </div>
           <div className="viewer-roster">
             <Users size={16} />{' '}
             {roster.length ? roster.map((person) => <span key={person.peerId} dir="auto">{person.name}{person.peerId === 'host' && <span className="host-pill">HOST</span>} · </span>) : 'Waiting for participants'}
           </div>
+          <p className="stream-stats" aria-label="Stream stats">{streamStats}</p>
           <div className="viewer-extras"><div className="subtitle-controls"><button className="button-subtle" onClick={() => setSubtitlesVisible(v => !v)}>{subtitlesVisible ? 'Subtitles on' : 'Subtitles off'}</button><select aria-label="Subtitle size" value={subtitleSize} onChange={event => setSubtitleSize(event.target.value as 'S' | 'M' | 'L')}><option>S</option><option>M</option><option>L</option></select></div>{chatPanel}</div>
         </main>
       )}
 
-      {kickTarget && <div className="modal-scrim"><div className="settings-modal" role="dialog" aria-modal="true" aria-label="Remove participant"><h2>Remove participant?</h2><p>Kick disconnects this viewer. Ban also blocks this peer ID for this room session.</p><div className="modal-actions"><button className="button-subtle" onClick={() => setKickTarget(null)}>Cancel</button><button className="button-subtle" onClick={() => { void kick(kickTarget) }}>Kick</button><button className="button-primary" onClick={() => { void kick(kickTarget, true) }}>Ban</button></div></div></div>}
+      {mode === 'host' && kickTarget && <div className="modal-scrim"><div className="settings-modal" role="dialog" aria-modal="true" aria-label="Remove participant"><h2>Remove participant?</h2><p>Kick disconnects this viewer. Ban also blocks this peer ID for this room session.</p><div className="modal-actions"><button className="button-subtle" onClick={() => setKickTarget(null)}>Cancel</button><button className="button-subtle" onClick={() => { void kick(kickTarget) }}>Kick</button><button className="button-primary" onClick={() => { void kick(kickTarget, true) }}>Ban</button></div></div></div>}
       {settingsOpen && (
         <div
           className="modal-scrim"

@@ -17,6 +17,7 @@ export type PartyCastApi = {
   loadEmbeddedSubtitle(index: number): Promise<PickedSubtitle | null>
   onWindowClosing(callback: () => void): () => void
   closeReady(): void
+  setFullscreen(fullscreen: boolean): Promise<boolean>
   relayHasKey(): Promise<boolean>
   relayDefaultUrl(): Promise<string>
   relayImport(): Promise<{ relayUrl: string } | null>

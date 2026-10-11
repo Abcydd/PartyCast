@@ -404,7 +404,23 @@ async function runE2eTest() {
       return null
     })
 
+    const audioEnergy = () => viewerPage.evaluate(async () => {
+      let energy = 0
+      for (const entry of window.__pcList || []) {
+        const reports = await entry.pc.getStats()
+        for (const r of reports.values()) if (r.type === 'inbound-rtp' && r.kind === 'audio') energy += r.totalAudioEnergy || 0
+      }
+      return energy
+    })
+    const energyStart = await audioEnergy()
+    await sleep(3000)
+    const energyEnd = await audioEnergy()
+    if (!(energyEnd > energyStart)) {
+      throw new Error(`Viewer inbound audio energy did not rise through the relay: ${energyStart} -> ${energyEnd}`)
+    }
+
     results.steps.step3_host_approves_playback = {
+      inboundAudioEnergy: [energyStart, energyEnd],
       passed: true,
       timeToMediaMs: Date.now() - approveStartTime,
       hasLiveVideoTrack: initialViewerMedia.hasVideoTrack,

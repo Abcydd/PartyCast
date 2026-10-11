@@ -1,6 +1,31 @@
-export function codecPreferenceOrder<T extends { mimeType: string }>(codecs: readonly T[]): T[] {
-  const rank = (mime: string): number => /\/AV1$/i.test(mime) ? 0 : /\/VP9$/i.test(mime) ? 1 : /\/H264$/i.test(mime) ? 2 : 3
-  return [...codecs].sort((a, b) => rank(a.mimeType) - rank(b.mimeType))
+export type VideoCodecResult = { supported: boolean; powerEfficient: boolean }
+
+const codecName = (mime: string): 'AV1' | 'H265' | 'H264' | 'VP9' | 'VP8' | null => {
+  const name = mime.split('/').at(-1)?.split(';')[0]?.toUpperCase()
+  if (name === 'AV1') return 'AV1'
+  if (name === 'H265' || name === 'HEVC') return 'H265'
+  if (name === 'H264') return 'H264'
+  if (name === 'VP9') return 'VP9'
+  if (name === 'VP8') return 'VP8'
+  return null
+}
+
+/** Rank only the codecs offered by the local sender. RTX and repair codecs follow media codecs. */
+export function codecPreferenceOrder<T extends { mimeType: string }>(
+  codecs: readonly T[],
+  results?: Readonly<Record<string, VideoCodecResult>>,
+): T[] {
+  const hardwareOrder = ['AV1', 'H265', 'H264', 'VP9']
+  const fallbackOrder = ['H264', 'VP9', 'AV1', 'H265', 'VP8']
+  const names = results
+    ? [...hardwareOrder.filter(name => results[name]?.supported && results[name]?.powerEfficient), ...fallbackOrder]
+    : fallbackOrder
+  const preference = new Map<string, number>()
+  names.forEach(name => { if (!preference.has(name)) preference.set(name, preference.size) })
+  const primary = codecs.filter(codec => codecName(codec.mimeType) !== null)
+  const auxiliary = codecs.filter(codec => codecName(codec.mimeType) === null)
+  primary.sort((a, b) => (preference.get(codecName(a.mimeType) ?? '') ?? 99) - (preference.get(codecName(b.mimeType) ?? '') ?? 99))
+  return [...primary, ...auxiliary]
 }
 
 export function resolutionScale(width: number, height: number, maxWidth = 1920, maxHeight = 1080): number {

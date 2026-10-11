@@ -7,7 +7,8 @@ import { effectiveQuality, BITRATES, type EffectiveQuality, type Quality } from 
 import { PeerRateLimiter } from '../../shared/rate-limit'
 import { normalizeRoomCode } from '../../shared/room-code'
 import type { Settings } from '../../shared/settings'
-import { codecPreferenceOrder, pinnedHostMatches } from '../../shared/video-encoding'
+import { pinnedHostMatches } from '../../shared/video-encoding'
+import { preferredVideoCodecs } from './video-codec'
 
 type Role = 'host' | 'viewer'
 export type NetworkOptions = { iceServers?: RTCIceServer[]; relayControl?: boolean; pinnedHostId?: string }
@@ -59,6 +60,7 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
   let closed = false
   let lastBytes = 0, lastTimestamp = 0
   const remoteStream = new MediaStream()
+  const codecNegotiationReady = new WeakSet<RTCPeerConnection>()
 
   const rtcConfig = network.iceServers ? { iceServers: network.iceServers, iceTransportPolicy: role === 'host' && network.relayControl ? 'relay' as const : 'all' as const } : iceConfiguration(settings)
   const room = joinRoom({ appId: 'partycast-v1', password: normalized, rtcConfig }, normalized, {
@@ -102,7 +104,7 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
     const message = decodeMessage(raw)
     if (!message || role === 'host' && !isViewerAllowedMessage(message) || role === 'viewer' && !isHostAllowedMessage(message)) { violation(peerId); return }
     if (role === 'host' && !approved.has(peerId) && message.type !== 'hello') { violation(peerId); return }
-    const category = message.type === 'chat' ? 'chat' : message.type === 'reaction' ? 'reaction' : 'other'
+    const category = message.type === 'chat' ? 'chat' : 'other'
     const limit = limiter.check(peerId, category)
     if (!limit.allowed) {
       if (role === 'host' && limit.violations >= 3) { events.onAbuse?.(peerId); block(peerId); room.getPeers()[peerId]?.close() }
@@ -149,15 +151,26 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
       }
     }
   }
+  async function prepareCodecNegotiation(pc: RTCPeerConnection): Promise<void> {
+    if (codecNegotiationReady.has(pc)) return
+    const codecs = RTCRtpSender.getCapabilities('video')?.codecs
+    if (!codecs) return
+    const preference = await preferredVideoCodecs(codecs)
+    const negotiate = pc.onnegotiationneeded
+    pc.onnegotiationneeded = event => {
+      for (const transceiver of pc.getTransceivers()) if (transceiver.sender.track?.kind === 'video') {
+        try { transceiver.setCodecPreferences(preference) } catch (cause) { console.warn('[PartyCast] codec preferences unavailable', cause) }
+      }
+      negotiate?.call(pc, event)
+    }
+    codecNegotiationReady.add(pc)
+  }
   async function attach(peerId: string): Promise<void> {
     if (!currentStream?.getTracks().length || !room.getPeers()[peerId] || !approved.has(peerId)) return
     const pc = room.getPeers()[peerId]
     const senderTracks = pc.getSenders().map(sender => sender.track)
+    await prepareCodecNegotiation(pc)
     for (const track of currentStream.getTracks()) if (!senderTracks.includes(track)) await Promise.all(room.addTrack(track, currentStream, { target: peerId }))
-    const codecs = RTCRtpSender.getCapabilities('video')?.codecs
-    if (codecs) for (const transceiver of pc.getTransceivers()) if (transceiver.sender.track?.kind === 'video') {
-      try { transceiver.setCodecPreferences(codecPreferenceOrder(codecs)) } catch { /* Negotiated already. */ }
-    }
     await applyBitrate(peerId)
   }
   async function updateStream(stream: MediaStream | null): Promise<void> {
@@ -189,12 +202,24 @@ export function openPartyRoom(role: Role, code: string, settings: Settings, even
     setHostStream(stream) { mediaTask = mediaTask.catch(() => {}).then(() => updateStream(stream)); return mediaTask },
     async setQuality(next) { currentQuality = next; await applyBitrate() },
     async stats() {
-      const connection = Object.entries(room.getPeers()).find(([id]) => approved.has(id))?.[1]
-      if (!connection) return 'Waiting for an approved viewer'
+      const connection = role === 'host'
+        ? Object.entries(room.getPeers()).find(([id]) => approved.has(id))?.[1]
+        : hostId ? room.getPeers()[hostId] : undefined
+      if (!connection) return role === 'host' ? 'Waiting for an approved viewer' : 'Waiting for host media'
       const reports = await connection.getStats()
-      let codec = 'Negotiating', width = 0, height = 0, bitrate = 0
-      reports.forEach(report => { if (report.type === 'outbound-rtp' && report.kind === 'video') { width = report.frameWidth ?? width; height = report.frameHeight ?? height; const info = reports.get(report.codecId); if (info?.mimeType) codec = String(info.mimeType).replace(/^video\//, ''); if (lastTimestamp && report.timestamp > lastTimestamp) bitrate = (report.bytesSent - lastBytes) * 8 / (report.timestamp - lastTimestamp) / 1000; lastBytes = report.bytesSent; lastTimestamp = report.timestamp } })
-      return `${codec} · ${width || '?'}×${height || '?'} · ${bitrate.toFixed(2)} Mbps (${(BITRATES[currentQuality] / 1_000_000).toFixed(1)} cap)`
+      let codec = 'Negotiating', width = 0, height = 0, bitrate = 0, audioEnergy = 0
+      reports.forEach(report => {
+        const mediaReport = role === 'host' ? report.type === 'outbound-rtp' : report.type === 'inbound-rtp'
+        if (mediaReport && report.kind === 'video') {
+          width = report.frameWidth ?? width; height = report.frameHeight ?? height
+          const info = reports.get(report.codecId); if (info?.mimeType) codec = String(info.mimeType).replace(/^video\//, '')
+          if (role === 'host' && lastTimestamp && report.timestamp > lastTimestamp) bitrate = (report.bytesSent - lastBytes) * 8 / (report.timestamp - lastTimestamp) / 1000
+          if (role === 'host') { lastBytes = report.bytesSent; lastTimestamp = report.timestamp }
+        }
+        if (role === 'viewer' && report.type === 'inbound-rtp' && report.kind === 'audio') audioEnergy = report.totalAudioEnergy ?? audioEnergy
+      })
+      const audio = role === 'viewer' ? ` · audio energy ${audioEnergy}` : ''
+      return `${codec} · ${width || '?'}×${height || '?'} · ${bitrate.toFixed(2)} Mbps (${(BITRATES[currentQuality] / 1_000_000).toFixed(1)} cap)${audio}`
     },
     async approvePeer(peerId) { if (role !== 'host' || !connected.has(peerId) || blocked.has(peerId)) return; approved.add(peerId); if (!network.relayControl) { await mediaTask; await attach(peerId) } },
     rejectPeer(peerId) { block(peerId); approved.delete(peerId); connected.delete(peerId); room.getPeers()[peerId]?.close() },

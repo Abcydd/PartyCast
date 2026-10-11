@@ -1,5 +1,5 @@
-export type RateCategory = 'chat' | 'reaction' | 'other'
-const capacities: Record<RateCategory, number> = { chat: 5, reaction: 10, other: 20 }
+export type RateCategory = 'chat' | 'other'
+const capacities: Record<RateCategory, number> = { chat: 5, other: 20 }
 type Bucket = { tokens: number; updated: number }
 
 export class PeerRateLimiter {
@@ -25,7 +25,7 @@ export class PeerRateLimiter {
   }
 
   forget(peerId: string): void {
-    for (const category of ['chat', 'reaction', 'other']) this.buckets.delete(`${peerId}:${category}`)
+    for (const category of ['chat', 'other']) this.buckets.delete(`${peerId}:${category}`)
     this.violations.delete(peerId)
   }
 }

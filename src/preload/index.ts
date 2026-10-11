@@ -23,6 +23,7 @@ const api: PartyCastApi = {
     return () => ipcRenderer.removeListener('app:closing', listener)
   },
   closeReady: () => ipcRenderer.send('app:close-ready'),
+  setFullscreen: fullscreen => ipcRenderer.invoke('window:fullscreen', fullscreen),
   relayHasKey: () => ipcRenderer.invoke('relay:has-key'),
   relayDefaultUrl: async () => (await ipcRenderer.invoke('settings:relay-default')) ?? '',
   relayImport: () => ipcRenderer.invoke('relay:import'),

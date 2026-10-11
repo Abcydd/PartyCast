@@ -1,5 +1,6 @@
 import { RELAY_BITRATES, RELAY_HEIGHT, type RelayQuality } from '../../shared/relay-config'
-import { codecPreferenceOrder, resolutionScale } from '../../shared/video-encoding'
+import { resolutionScale } from '../../shared/video-encoding'
+import { preferredVideoCodecs } from './video-codec'
 import type { RelayOperation } from '../../main/relay-ipc'
 
 type Reply = Record<string, unknown>
@@ -48,9 +49,9 @@ async function gathered(pc: RTCPeerConnection, settleMs = 600, timeoutMs = 10000
 // drops, so it arrives in the main process as {} — always send a plain object over IPC.
 const plainDescription = (pc: RTCPeerConnection): RTCSessionDescriptionInit | null =>
   pc.localDescription ? { type: pc.localDescription.type, sdp: pc.localDescription.sdp } : null
-function prioritizeVideo(transceiver: RTCRtpTransceiver): void {
+async function prioritizeVideo(transceiver: RTCRtpTransceiver): Promise<void> {
   const codecs = RTCRtpSender.getCapabilities('video')?.codecs
-  if (codecs) try { transceiver.setCodecPreferences(codecPreferenceOrder(codecs)) } catch { /* Browser fallback. */ }
+  if (codecs) try { transceiver.setCodecPreferences(await preferredVideoCodecs(codecs)) } catch { /* Browser fallback. */ }
 }
 async function capVideo(sender: RTCRtpSender, track: MediaStreamTrack, quality: RelayQuality): Promise<void> {
   track.contentHint = 'motion'
@@ -98,11 +99,15 @@ export class RelayPublisher {
     this.pc = pc
     const transceivers = tracks.map(track => {
       const transceiver = pc.addTransceiver(track, { direction: 'sendonly' })
-      if (track.kind === 'video') { this.videoSender = transceiver.sender; prioritizeVideo(transceiver) }
+      if (track.kind === 'video') this.videoSender = transceiver.sender
       if (track.kind === 'audio') this.audioSender = transceiver.sender
       return { track, transceiver }
     })
-    if (this.videoSender) await capVideo(this.videoSender, tracks.find(t => t.kind === 'video')!, this.quality)
+    if (this.videoSender) {
+      const videoTransceiver = transceivers.find(({ track }) => track.kind === 'video')?.transceiver
+      if (videoTransceiver) await prioritizeVideo(videoTransceiver)
+      await capVideo(this.videoSender, tracks.find(t => t.kind === 'video')!, this.quality)
+    }
     const session = await relayCall('hostSession', { roomId: this.roomId })
     if (typeof session.sessionId !== 'string') throw new RelayError(502, 'invalid-session')
     this.sessionId = session.sessionId

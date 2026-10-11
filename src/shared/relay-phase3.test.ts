@@ -28,12 +28,12 @@ describe('relay configuration and identity', () => {
     expect(decodeMessage(valid)).toMatchObject({ type: 'approval', relay: { roomId } })
     expect(decodeMessage(JSON.stringify({ version: 1, type: 'approval', accepted: false, relay: { roomId, ticket: 'payload.signature' } }))).toBeNull()
     expect(decodeMessage(JSON.stringify({ version: 1, type: 'approval', accepted: true, relay: { roomId: '../host', ticket: 'bad' } }))).toBeNull()
-    expect(decodeMessage(JSON.stringify({ version: 1, type: 'state', playing: true, currentTime: 0, duration: 10, title: 'clip.mp4', relayRevision: 2 }))).toMatchObject({ relayRevision: 2 })
-    expect(decodeMessage(JSON.stringify({ version: 1, type: 'state', playing: true, currentTime: 0, duration: 10, title: 'clip.mp4', relayRevision: -1 }))).toBeNull()
+    expect(decodeMessage(JSON.stringify({ version: 1, type: 'state', playing: true, currentTime: 0, duration: 10, sentAt: 123, title: 'clip.mp4', relayRevision: 2 }))).toMatchObject({ relayRevision: 2 })
+    expect(decodeMessage(JSON.stringify({ version: 1, type: 'state', playing: true, currentTime: 0, duration: 10, sentAt: 123, title: 'clip.mp4', relayRevision: -1 }))).toBeNull()
   })
   it('orders supported video codecs and caps both dimensions', () => {
     const codecs = [{ mimeType: 'video/H264' }, { mimeType: 'video/VP8' }, { mimeType: 'video/VP9' }, { mimeType: 'video/AV1' }]
-    expect(codecPreferenceOrder(codecs).map(c => c.mimeType)).toEqual(['video/AV1', 'video/VP9', 'video/H264', 'video/VP8'])
+    expect(codecPreferenceOrder(codecs).map(c => c.mimeType)).toEqual(['video/H264', 'video/VP9', 'video/AV1', 'video/VP8'])
     expect(resolutionScale(3840, 2160)).toBe(2)
     expect(resolutionScale(2560, 1080)).toBeCloseTo(4 / 3)
     expect(resolutionScale(1280, 720)).toBe(1)

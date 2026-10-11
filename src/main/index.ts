@@ -16,6 +16,7 @@ import { executeHook } from './hooks'
 import { parseRangeHeader } from './range'
 import type { PickedMedia, EmbeddedSubtitleTrack } from '../shared/electron-api'
 import { effectiveRelayUrl, type HookConfig } from '../shared/relay-config'
+import { allowAppPermission } from './permissions'
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -102,8 +103,14 @@ if (qa.isQa) {
 }
 
 app.whenReady().then(() => {
-  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
-  session.defaultSession.setPermissionCheckHandler(() => false)
+  const ownPermissionContents = (contents: Electron.WebContents | null): boolean => {
+    if (!contents || !appContents.has(contents) || contents.isDestroyed() || !contents.mainFrame) return false
+    const url = contents.mainFrame.url
+    const devUrl = process.env.ELECTRON_RENDERER_URL
+    return devUrl ? url === devUrl || url === `${devUrl.replace(/\/$/, '')}/` : isOwnRendererUrl(url, join(__dirname, '../renderer/index.html'))
+  }
+  session.defaultSession.setPermissionRequestHandler((contents, permission, callback) => callback(allowAppPermission(ownPermissionContents(contents), permission)))
+  session.defaultSession.setPermissionCheckHandler((contents, permission) => allowAppPermission(ownPermissionContents(contents), permission))
   protocol.handle('partycast-media', async (request) => {
     const token = new URL(request.url).pathname.slice(1)
     const path = mediaFiles.get(token)
@@ -147,6 +154,13 @@ app.whenReady().then(() => {
     return isOwnRendererUrl(url, join(__dirname, '../renderer/index.html'))
   }
   ipcMain.handle('settings:load', (event) => trusted(event) ? loadSettings(settingsPath()) : null)
+  ipcMain.handle('window:fullscreen', (event, fullscreen: unknown) => {
+    if (!trusted(event) || typeof fullscreen !== 'boolean') return false
+    const window = BrowserWindow.fromWebContents(event.sender)
+    if (!window || window.isDestroyed()) return false
+    window.setFullScreen(fullscreen)
+    return true
+  })
   ipcMain.handle('settings:relay-default', event => trusted(event) ? effectiveRelayUrl('', __DEFAULT_RELAY_URL__) : null)
   ipcMain.handle('settings:save', (event, settings: unknown) => trusted(event) ? saveSettings(settingsPath(), settings) : null)
   ipcMain.handle('hook:configure', async (event, proposed: unknown) => {

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { PeerRateLimiter } from './rate-limit'
 import { sanitizeChat, sanitizeName, sanitizeSubtitleText } from './text'
-import { isReaction } from './reactions'
 import { parseHandshake } from './handshake'
 import { cueAtTime, parseSubtitles } from './subtitles'
 import { effectiveQuality, estimatedUploadMbps } from './quality'
@@ -23,9 +22,7 @@ describe('untrusted input', () => {
     expect(sanitizeChat('x'.repeat(501))).toHaveLength(500)
     expect(sanitizeSubtitleText('<i>مرحبا</i> {\\an8}world')).toBe('مرحبا world')
   })
-  it('accepts only known reactions and exact handshake shapes', () => {
-    expect(isReaction('❤️')).toBe(true)
-    expect(isReaction('💣')).toBe(false)
+  it('accepts exact handshake shapes', () => {
     expect(parseHandshake({ role: 'host', status: 'ok' })).toEqual({ role: 'host', status: 'ok' })
     expect(parseHandshake({ role: 'viewer', status: 'ok' })).toBeNull()
     expect(parseHandshake({ role: 'host', status: 'admin' })).toBeNull()
